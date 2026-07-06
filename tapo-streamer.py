@@ -182,8 +182,6 @@ class tapoStreamer:
                     "On Fedora/RHEL, install ffmpeg from RPM Fusion for a "
                     "hardware-capable build (h264 with vaapi/cuda/qsv support)."
                 )
-            else:
-                pass
         except FileNotFoundError:
             pass
         except Exception:
@@ -198,7 +196,11 @@ class tapoStreamer:
             logging.getLogger().setLevel(logging.CRITICAL + 1)
             return
 
-        log_level = logging.DEBUG
+        # INFO rather than DEBUG: the app itself only ever logs at
+        # info/warning/error, so this loses none of its own output, but it
+        # blocks debug-level chatter from third-party libraries (onvif,
+        # urllib3, PIL, etc.) that would otherwise flood the log file.
+        log_level = logging.INFO
         log_dir = os.path.dirname(self.config_file)
         log_file = os.path.join(log_dir, "tapo-streamer.log")
 
@@ -213,7 +215,7 @@ class tapoStreamer:
 
         logging.getLogger('zeep.xsd.types.simple').setLevel(logging.WARNING)
 
-        logging.info("Logging initialized with level DEBUG")
+        logging.info("Logging initialized with level INFO")
 
     def __init__(self, root):
         # Parse command-line arguments
@@ -337,15 +339,24 @@ class tapoStreamer:
         self._pending_event_afters = []
         self.events_button = None
         self.events_button_image = None
+        self.event_back_button = None
+        self.event_back_button_image = None
         self.watch_progress = {index: {} for index in range(4)}
         self.watch_progress_dirty = False
         self.visited_folders = {index: set() for index in range(4)}
 
+        # Sleep mode: stop live streams after the app has been unfocused
+        # or minimized for sleep_mode_minutes, and restart them when the
+        # app is brought back to focus. 0 minutes disables the feature.
+        self._sleep_timer_id = None
+        self._is_asleep = False
+        self._sleep_stopped_indices = []
+        self._app_focused = True
+        self._app_minimized = False
+
         self.panel_sizes = [(0, 0)] * 4
         self.target_dims = [(0, 0)] * 4
         self.frame_shapes = [(0, 0)] * 4
-        self.last_layout_update = 0
-        self.debounce_timer = None
   
         # Initialize frame count tracking
         self.last_dropped_frames = {}  # Last cumulative dropped frames per stream
@@ -376,10 +387,22 @@ class tapoStreamer:
             "folder_clicked": self.create_icon("folder", opacity=0.6),
             "archive": self.create_icon("archive", opacity=1.0),
             "events": self.create_icon("events"),
+            "list": self.create_icon("list"),
             "delete": self.create_icon("delete"),
             "audio_on": self.create_icon("audio_on"),
             "audio_off": self.create_icon("audio_off"),
         }
+        # Red variants of the mode-toggle icons, swapped in while Archive /
+        # Events mode is active so the button visually indicates current mode.
+        self.icon_cache["disk_active"] = self.recolor_icon_active(self.icon_cache["disk"])
+        self.icon_cache["events_active"] = self.recolor_icon_active(self.icon_cache["events"])
+        # Dimmed variants, swapped in while the button is disabled (e.g.
+        # live streams reinitializing) so the button visibly reads as
+        # inactive/locked rather than looking indistinguishable from its
+        # normal enabled state - plain Tk disabled-state rendering for
+        # image buttons is inconsistent across platforms/themes.
+        self.icon_cache["disk_disabled"] = self.dim_icon(self.icon_cache["disk"])
+        self.icon_cache["events_disabled"] = self.dim_icon(self.icon_cache["events"])
 
         self.day_folder_icon_cache = {}
         self.thumbnail_cache = {}
@@ -439,7 +462,7 @@ class tapoStreamer:
                 except Exception:
                     pass
         except Exception as e:
-            logging.debug(f"Could not detect system theme, defaulting to dark: {e}")
+            logging.warning(f"Could not detect system theme, defaulting to dark: {e}")
         return "dark"
 
     def apply_theme(self):
@@ -596,6 +619,7 @@ class tapoStreamer:
         self.controls_position = "top-left"
         self.default_event_filter = "all"
         self.ui_theme = "dark"
+        self.sleep_mode_minutes = 0
 
         # Load from config file if it exists
         if os.path.exists(self.config_file):
@@ -646,6 +670,14 @@ class tapoStreamer:
                 if self.ui_theme not in ("dark", "light", "system"):
                     logging.warning(f"Invalid ui_theme: {self.ui_theme}, using default 'dark'")
                     self.ui_theme = "dark"
+                try:
+                    self.sleep_mode_minutes = int(config.get("sleep_mode_minutes", self.sleep_mode_minutes))
+                    if self.sleep_mode_minutes < 0:
+                        logging.warning(f"Invalid sleep_mode_minutes: {self.sleep_mode_minutes}, using default 0")
+                        self.sleep_mode_minutes = 0
+                except (ValueError, TypeError):
+                    logging.warning(f"Invalid sleep_mode_minutes input, using default 0")
+                    self.sleep_mode_minutes = 0
 
                 # Validate settings
                 try:
@@ -742,6 +774,7 @@ class tapoStreamer:
             "controls_position": self.controls_position,
             "default_event_filter": self.default_event_filter,
             "ui_theme": self.ui_theme,
+            "sleep_mode_minutes": self.sleep_mode_minutes,
         }
         try:
             os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
@@ -903,6 +936,41 @@ class tapoStreamer:
         ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
         row += 1
 
+        tk.Label(core_frame, text="Font:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
+        font_var = tk.StringVar(value=self.ui_font)
+        ttk.Combobox(
+            core_frame, textvariable=font_var, values=self.font_choice_labels, state="readonly", width=16
+        ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
+
+        tk.Label(core_frame, text="Player Controls:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
+        controls_position_var = tk.StringVar(value=self.controls_position)
+        ttk.Combobox(
+            core_frame, textvariable=controls_position_var,
+            values=self.CONTROL_POSITIONS, state="readonly", width=16
+        ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
+
+        fullscreen_buttons_var = tk.BooleanVar(value=self.enable_fullscreen_buttons)
+        fullscreen_buttons_cb = ttk.Checkbutton(
+            core_frame, text="Show Stream Buttons", variable=fullscreen_buttons_var
+        )
+        fullscreen_buttons_cb.grid(row=row, column=0, **SPAN)
+        if sys.platform.startswith('win'):
+            fullscreen_buttons_var.set(True)
+            fullscreen_buttons_cb.configure(state="disabled")
+            tk.Label(
+                core_frame, text="Required on Windows",
+                font=self.app_font(9), fg="#888888"
+            ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
+
+        save_window_size_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(core_frame, text="Save Window Size", variable=save_window_size_var).grid(
+            row=row, column=0, **SPAN
+        )
+        row += 1
+
         row = add_section_header(core_frame, "Playback & Display", row)
 
         tk.Label(core_frame, text="PTZ Travel:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
@@ -919,37 +987,6 @@ class tapoStreamer:
         ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
         row += 1
 
-        tk.Label(core_frame, text="Font:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
-        font_var = tk.StringVar(value=self.ui_font)
-        ttk.Combobox(
-            core_frame, textvariable=font_var, values=self.font_choice_labels, state="readonly", width=16
-        ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
-        row += 1
-
-        tk.Label(core_frame, text="Player Controls:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
-        controls_position_var = tk.StringVar(value=self.controls_position)
-        ttk.Combobox(
-            core_frame, textvariable=controls_position_var,
-            values=self.CONTROL_POSITIONS, state="readonly", width=16
-        ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
-        row += 1
-
-        row = add_section_header(core_frame, "Behavior", row)
-
-        fullscreen_buttons_var = tk.BooleanVar(value=self.enable_fullscreen_buttons)
-        fullscreen_buttons_cb = ttk.Checkbutton(
-            core_frame, text="Show Stream Buttons", variable=fullscreen_buttons_var
-        )
-        fullscreen_buttons_cb.grid(row=row, column=0, **SPAN)
-        if sys.platform.startswith('win'):
-            fullscreen_buttons_var.set(True)
-            fullscreen_buttons_cb.configure(state="disabled")
-            tk.Label(
-                core_frame, text="Required on Windows",
-                font=self.app_font(9), fg="#888888"
-            ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
-        row += 1
-
         resume_playback_var = tk.BooleanVar(value=self.resume_playback)
         ttk.Checkbutton(
             core_frame, text="Resume Archive Clips From Last Position", variable=resume_playback_var
@@ -962,6 +999,18 @@ class tapoStreamer:
             variable=exclusive_audio_var
         ).grid(row=row, column=0, **SPAN)
         row += 1
+
+        tk.Label(core_frame, text="Sleep Mode (min):", font=self.app_font(10)).grid(row=row, column=0, **LBL)
+        sleep_mode_entry = tk.Entry(core_frame, width=10)
+        sleep_mode_entry.insert(0, str(self.sleep_mode_minutes))
+        sleep_mode_entry.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        tk.Label(
+            core_frame, text="Stop live streams when unfocused/minimized this long. 0 = disabled",
+            font=self.app_font(9), fg="#888888"
+        ).grid(row=row + 1, column=0, columnspan=2, sticky="w", padx=(12, 12), pady=(0, 4))
+        row += 2
+
+        row = add_section_header(core_frame, "Events", row)
 
         motion_events_var = tk.BooleanVar(value=self.motion_triggered_events)
         ttk.Checkbutton(core_frame, text="Motion Triggered Events", variable=motion_events_var).grid(
@@ -1002,8 +1051,6 @@ class tapoStreamer:
         ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
         row += 1
 
-        row = add_section_header(core_frame, "Events Cache", row)
-
         def _clear_events_cache():
             events_dir = self._events_dir()
             removed = 0
@@ -1041,12 +1088,6 @@ class tapoStreamer:
             cache_row, text="Forces a fresh scan next time Events are opened",
             font=self.app_font(9), fg="#888888"
         ).pack(side="left", padx=(10, 0))
-        row += 1
-
-        save_window_size_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(core_frame, text="Save Window Size", variable=save_window_size_var).grid(
-            row=row, column=0, **SPAN
-        )
         row += 1
 
         # --- Advanced Tab ---
@@ -1149,7 +1190,7 @@ class tapoStreamer:
                 downgrade_cooldown_entry, enable_auto_revert_hq_var, stability_period_entry,
                 playback_speed_var, font_var, no_frame_timeout_entry, resume_playback_var,
                 motion_events_var, event_overlap_var, exclusive_audio_var, default_filter_var,
-                theme_var, controls_position_var
+                theme_var, controls_position_var, sleep_mode_entry
             )
         ).pack(side="left", padx=5)
 
@@ -1160,8 +1201,16 @@ class tapoStreamer:
 
         dialog.update_idletasks()
 
-    def save_streams(self, username_entry, password_entry, ip_entries, hq_checkboxes, audio_checkboxes, ptz_checkboxes, fullscreen_buttons_var, debug_var, archive_entry, vlc_params, ptz_resolution_var, save_window_size_var, dialog, enable_retries_var, max_retry_attempts_entry, initial_backoff_delay_entry, enable_quality_downgrade_var, drop_threshold_entry, drop_window_entry, downgrade_cooldown_entry, enable_auto_revert_hq_var, stability_period_entry, playback_speed_var, font_var=None, no_frame_timeout_entry=None, resume_playback_var=None, motion_events_var=None, event_overlap_var=None, exclusive_audio_var=None, default_filter_var=None, theme_var=None, controls_position_var=None):
+    def save_streams(self, username_entry, password_entry, ip_entries, hq_checkboxes, audio_checkboxes, ptz_checkboxes, fullscreen_buttons_var, debug_var, archive_entry, vlc_params, ptz_resolution_var, save_window_size_var, dialog, enable_retries_var, max_retry_attempts_entry, initial_backoff_delay_entry, enable_quality_downgrade_var, drop_threshold_entry, drop_window_entry, downgrade_cooldown_entry, enable_auto_revert_hq_var, stability_period_entry, playback_speed_var, font_var=None, no_frame_timeout_entry=None, resume_playback_var=None, motion_events_var=None, event_overlap_var=None, exclusive_audio_var=None, default_filter_var=None, theme_var=None, controls_position_var=None, sleep_mode_entry=None):
         old_fullscreen_buttons = self.enable_fullscreen_buttons
+        # Snapshot which streams were actually live (connected, not just
+        # configured) before we touch any config, so saving doesn't force a
+        # reconnect on cameras that weren't playing (e.g. disabled, in
+        # archive mode, or in a failed/not-yet-connected state).
+        was_playing = [
+            bool(self.media_players[i]) and not self.is_archive_mode[i]
+            for i in range(4)
+        ]
         self.username = username_entry.get().strip()
         self.password = password_entry.get().strip()
         self.archive_dir = archive_entry.get().strip()
@@ -1189,6 +1238,15 @@ class tapoStreamer:
         if controls_position_var is not None:
             v = controls_position_var.get()
             self.controls_position = v if v in self.CONTROL_POSITIONS else "top-left"
+        if sleep_mode_entry is not None:
+            try:
+                self.sleep_mode_minutes = int(sleep_mode_entry.get().strip())
+                if self.sleep_mode_minutes < 0:
+                    logging.warning(f"Invalid sleep_mode_minutes: {self.sleep_mode_minutes}, using default 0")
+                    self.sleep_mode_minutes = 0
+            except ValueError:
+                logging.warning(f"Invalid sleep_mode_minutes input, using default 0")
+                self.sleep_mode_minutes = 0
         if default_filter_var is not None:
             chosen_label = default_filter_var.get()
             if chosen_label == self.ALL_TYPES_LABEL:
@@ -1308,9 +1366,10 @@ class tapoStreamer:
         # Update label bindings and rebuild config panel
         self.update_label_bindings()
         self.build_config_panel()
+        self._rearm_sleep_mode_timer()
 
         dialog.destroy()
-        threading.Thread(target=self.start_streams, daemon=True).start()
+        threading.Thread(target=self.restart_previously_playing_streams, args=(was_playing,), daemon=True).start()
 
     def check_network_connectivity(self, ip_input):
         """
@@ -1481,6 +1540,11 @@ class tapoStreamer:
             draw.line([(26, 9), (26, 14)], fill="white", width=2)
             # lightning bolt inside calendar body
             draw.polygon([(22, 19), (18, 25), (21, 25), (18, 31), (24, 23), (21, 23)], fill="white")
+        elif icon_type == "list":
+            # Justified-list glyph: a bullet dot + horizontal rule on each row
+            for row_y in (11, 20, 29):
+                draw.ellipse([(8, row_y - 2), (12, row_y + 2)], fill="white")
+                draw.line([(17, row_y), (32, row_y)], fill="white", width=3)
         elif icon_type == "delete":
             # Trash can
             draw.rectangle([(13, 14), (27, 31)], outline="white", width=2)
@@ -1507,6 +1571,38 @@ class tapoStreamer:
             draw.polygon([(10, 30), (20, 15), (30, 30)], fill="white")
         elif icon_type == "down":
             draw.polygon([(10, 10), (20, 25), (30, 10)], fill="white")
+        return ImageTk.PhotoImage(img)
+
+    ACTIVE_MODE_COLOR = "#e62117"
+
+    def recolor_icon_active(self, photo_image):
+        """Return a red-tinted variant of a cached white-on-black icon
+        PhotoImage, used to indicate a mode button (Archive/Events) is
+        currently active. Recolors white pixels to ACTIVE_MODE_COLOR while
+        preserving alpha and leaving black/other pixels untouched."""
+        img = ImageTk.getimage(photo_image).convert("RGBA")
+        r, g, b = tuple(int(self.ACTIVE_MODE_COLOR[i:i + 2], 16) for i in (1, 3, 5))
+        pixels = img.load()
+        for y in range(img.height):
+            for x in range(img.width):
+                pr, pg, pb, pa = pixels[x, y]
+                if pr > 200 and pg > 200 and pb > 200:
+                    pixels[x, y] = (r, g, b, pa)
+        return ImageTk.PhotoImage(img)
+
+    def dim_icon(self, photo_image, opacity=0.55):
+        """Return a faded variant of a cached icon PhotoImage, used to show
+        a mode button (Archive/Events) as inactive/locked while disabled.
+        Scales alpha only, leaving color untouched, so it reads as dimmed
+        rather than recolored - this is used instead of relying on Tk's
+        native disabled-image rendering, which is inconsistent across
+        platforms/themes for plain (non-ttk) image buttons."""
+        img = ImageTk.getimage(photo_image).convert("RGBA")
+        pixels = img.load()
+        for y in range(img.height):
+            for x in range(img.width):
+                pr, pg, pb, pa = pixels[x, y]
+                pixels[x, y] = (pr, pg, pb, int(pa * opacity))
         return ImageTk.PhotoImage(img)
 
     def get_day_folder_icon(self, day_abbrev, is_clicked):
@@ -1580,8 +1676,6 @@ class tapoStreamer:
                     return
                 if not self.enable_fullscreen_buttons and self.streams[index]:
                     self.labels[index].bind("<Button-1>", lambda event, idx=index: self.handle_stream_click(idx))
-                else:
-                    pass
         except Exception as e:
             logging.error(f"Stream {index}: Failed to bind stream label: {e}")
 
@@ -1611,59 +1705,73 @@ class tapoStreamer:
                 logging.info(f"Entered fullscreen mode for stream {i}")
                 break
 
+    def _return_to_event_listing(self):
+        """Force-finish any currently playing event clips and return to the
+        event listing overlay, without leaving event mode entirely. Shared
+        by the right-click/Down-arrow exit_fullscreen path and the explicit
+        'back to list' button (needed on Windows when 4 cams are streaming,
+        since right-click over the embedded VLC surface may not be caught)."""
+        playing = self.event_active_cams - self.event_done_cams
+        if playing:
+            # Cancel any pending delayed clip launches before stopping
+            # players so no new playback starts after cleanup.
+            for _after_id in self._pending_event_afters:
+                try:
+                    self.root.after_cancel(_after_id)
+                except Exception:
+                    pass
+            self._pending_event_afters.clear()
+            # Force-finish every cam that still has an active player.
+            for i in list(playing):
+                self.event_clip_queues[i] = []   # clear queue so no next-clip is started
+                self.event_done_cams.add(i)
+                self.cleanup_stream(i)
+                for widget in self.labels[i].winfo_children():
+                    widget.destroy()
+                self._reset_clip_buttons(i)
+                self.is_archive_mode[i] = False
+                self._set_event_blank_label(i)
+
+            # All cams are now done — mark event played and re-show overlay
+            if self.current_playing_event:
+                self.current_playing_event["played"] = True
+                self._save_events_json(
+                    getattr(self, "_event_date_for_save", None),
+                    getattr(self, "_event_list_for_save", [])
+                )
+                try:
+                    if self._event_played_label and self._event_played_label.winfo_exists():
+                        self._event_played_label.configure(text="✓")
+                except Exception:
+                    pass
+
+            # If a single-cam event entered fullscreen, drop back to grid
+            # before re-showing the overlay so it centres over all panels.
+            if getattr(self, '_event_entered_fullscreen', False):
+                self.is_fullscreen = False
+                self.fullscreen_index = -1
+                self._event_entered_fullscreen = False
+                self.update_layout()
+                self.build_config_panel()
+            else:
+                # Multi-cam events stay in grid - still need to refresh so
+                # the back-to-listing button (only shown while a clip is
+                # actively playing) is hidden again now that we've stopped.
+                self.build_config_panel()
+
+            if self.event_overlay and self.event_overlay.winfo_exists():
+                ow, oh = getattr(self, "_event_overlay_size", (820, 500))
+                self.event_overlay.place(relx=0.5, rely=0.5, anchor="center", width=ow, height=oh)
+                self.event_overlay.lift()
+        else:
+            # Overlay is already showing, no clips running — exit to live
+            self._exit_event_mode()
+
     def exit_fullscreen(self, event=None):
 
         # Event mode intercept
         if self.event_mode:
-            playing = self.event_active_cams - self.event_done_cams
-            if playing:
-                # Cancel any pending delayed clip launches before stopping
-                # players so no new playback starts after cleanup.
-                for _after_id in self._pending_event_afters:
-                    try:
-                        self.root.after_cancel(_after_id)
-                    except Exception:
-                        pass
-                self._pending_event_afters.clear()
-                # Force-finish every cam that still has an active player.
-                for i in list(playing):
-                    self.event_clip_queues[i] = []   # clear queue so no next-clip is started
-                    self.event_done_cams.add(i)
-                    self.cleanup_stream(i)
-                    for widget in self.labels[i].winfo_children():
-                        widget.destroy()
-                    self._reset_clip_buttons(i)
-                    self.labels[i].configure(image="", text=f"Cam {i + 1}", fg="#888888", bg="black")
-
-                # All cams are now done — mark event played and re-show overlay
-                if self.current_playing_event:
-                    self.current_playing_event["played"] = True
-                    self._save_events_json(
-                        getattr(self, "_event_date_for_save", None),
-                        getattr(self, "_event_list_for_save", [])
-                    )
-                    try:
-                        if self._event_played_label and self._event_played_label.winfo_exists():
-                            self._event_played_label.configure(text="✓")
-                    except Exception:
-                        pass
-
-                # If a single-cam event entered fullscreen, drop back to grid
-                # before re-showing the overlay so it centres over all panels.
-                if getattr(self, '_event_entered_fullscreen', False):
-                    self.is_fullscreen = False
-                    self.fullscreen_index = -1
-                    self._event_entered_fullscreen = False
-                    self.update_layout()
-                    self.build_config_panel()
-
-                if self.event_overlay and self.event_overlay.winfo_exists():
-                    ow, oh = getattr(self, "_event_overlay_size", (820, 500))
-                    self.event_overlay.place(relx=0.5, rely=0.5, anchor="center", width=ow, height=oh)
-                    self.event_overlay.lift()
-            else:
-                # Overlay is already showing, no clips running — exit to live
-                self._exit_event_mode()
+            self._return_to_event_listing()
             return
         if self.is_fullscreen:
             idx = self.fullscreen_index
@@ -1742,6 +1850,14 @@ class tapoStreamer:
                     command=self.toggle_event_mode, cursor="hand2"
                 )
 
+            if not self.event_back_button:
+                self.event_back_button_image = self.icon_cache["list"]
+                self.event_back_button = tk.Button(
+                    self.config_panel, image=self.event_back_button_image, bg="#222222", bd=0,
+                    activebackground="#222222", relief="flat",
+                    command=self._return_to_event_listing, cursor="hand2"
+                )
+
             for i in range(4):
                 if not self.fullscreen_buttons[i]:
                     img = self.icon_cache["fullscreen"]
@@ -1762,6 +1878,7 @@ class tapoStreamer:
             # Forget all buttons before re-packing
             for button in self.ptz_buttons + [self.exit_fullscreen_button, self.config_button, self.archive_mode_button] + \
                           ([self.events_button] if self.events_button else []) + \
+                          ([self.event_back_button] if self.event_back_button else []) + \
                           [b for b in self.archive_buttons if b] + [b for b in self.fullscreen_buttons if b]:
                 button.pack_forget()
                 if button in self.fullscreen_buttons:
@@ -1774,26 +1891,80 @@ class tapoStreamer:
                 button.config(state="normal" if ptz_enabled else "disabled")
 
             # Pack buttons based on state
-            if self.is_fullscreen and self.fullscreen_index is not None:
+            if self.is_fullscreen and self.fullscreen_index is not None and not self.event_mode:
                 if (self.archive_dir and self.streams[self.fullscreen_index]):
+                    self.archive_buttons[self.fullscreen_index].configure(
+                        image=self.icon_cache["disk_active"] if self.is_archive_mode[self.fullscreen_index] else self.icon_cache["disk"]
+                    )
                     self.archive_buttons[self.fullscreen_index].pack(pady=5, padx=10)
                 if ptz_enabled:
                     for button in self.ptz_buttons:
                         button.pack(pady=5, padx=10)
-                self.exit_fullscreen_button.pack(pady=5, padx=10)
+                # The grid/exit-fullscreen button is redundant in fullscreen
+                # archive mode - clicking the archive button already exits
+                # archive mode (and drops back to grid), so only show it
+                # for live fullscreen.
+                if not self.is_archive_mode[self.fullscreen_index]:
+                    self.exit_fullscreen_button.pack(pady=5, padx=10)
+                # Offer the Events button in fullscreen too - both archive
+                # and live - so the user can jump straight to Events without
+                # backing out to grid first. Same button/behaviour as grid mode.
+                if self.motion_triggered_events and self.archive_dir:
+                    any_initializing = any(self.stream_initializing)
+                    self.events_button.configure(
+                        state="disabled" if any_initializing else "normal",
+                        image=(self.icon_cache["events_active"] if self.event_mode
+                               else self.icon_cache["events_disabled"] if any_initializing
+                               else self.icon_cache["events"])
+                    )
+                    self.events_button.pack(pady=5, padx=10)
                 self.config_button.pack(pady=5, padx=10)
+            elif self.event_mode:
+                # Event playback (single-cam events auto-enter fullscreen,
+                # multi-cam events stay in grid) always shows the same nav:
+                # Archive toggle, Events toggle, back-to-listing, and Config.
+                # No PTZ or exit-fullscreen/grid button, regardless of
+                # fullscreen state.
+                any_initializing = any(self.stream_initializing)
+                any_archive_mode = any(self.is_archive_mode[i] for i in range(4))
+                if self.archive_dir:
+                    self.archive_mode_button.configure(
+                        state="disabled" if any_initializing else "normal",
+                        image=(self.icon_cache["disk_active"] if any_archive_mode
+                               else self.icon_cache["disk_disabled"] if any_initializing
+                               else self.icon_cache["disk"])
+                    )
+                    self.archive_mode_button.pack(pady=5, padx=10)
+                if self.motion_triggered_events and self.archive_dir:
+                    self.events_button.configure(
+                        state="disabled" if any_initializing else "normal",
+                        image=self.icon_cache["events_active"]
+                    )
+                    self.events_button.pack(pady=5, padx=10)
+                # Only relevant while a clip is actively playing - the
+                # listing overlay itself is already visible otherwise.
+                if self.event_active_cams - self.event_done_cams:
+                    self.event_back_button.pack(pady=5, padx=10)
+                self.config_button.pack(pady=10, padx=10)
             else:
                 any_initializing = any(self.stream_initializing)
+                any_archive_mode = any(self.is_archive_mode[i] for i in range(4))
                 # Pack archive mode button only in grid mode if archive_dir is valid.
                 if self.archive_dir:
                     self.archive_mode_button.configure(
-                        state="disabled" if any_initializing else "normal"
+                        state="disabled" if any_initializing else "normal",
+                        image=(self.icon_cache["disk_active"] if any_archive_mode
+                               else self.icon_cache["disk_disabled"] if any_initializing
+                               else self.icon_cache["disk"])
                     )
                     self.archive_mode_button.pack(pady=5, padx=10)
                 # Pack events button in grid mode if motion_triggered_events is on
                 if self.motion_triggered_events and self.archive_dir:
                     self.events_button.configure(
-                        state="disabled" if any_initializing else "normal"
+                        state="disabled" if any_initializing else "normal",
+                        image=(self.icon_cache["events_active"] if self.event_mode
+                               else self.icon_cache["events_disabled"] if any_initializing
+                               else self.icon_cache["events"])
                     )
                     self.events_button.pack(pady=5, padx=10)
                 self.config_button.pack(pady=10, padx=10)
@@ -1894,8 +2065,180 @@ class tapoStreamer:
         self.root.bind("<Next>", lambda e: self.archive_change_page_shortcut(1))     # Page Down
         self.root.bind("<BackSpace>", lambda e: self.archive_go_back_shortcut())
 
+        # Sleep mode: track focus and minimize/restore transitions on the
+        # root window. Bound on root (not individual widgets) so it fires
+        # regardless of which child currently has focus, on both platforms.
+        self.root.bind("<FocusIn>", self._on_app_focus_in)
+        self.root.bind("<FocusOut>", self._on_app_focus_out)
+        self.root.bind("<Unmap>", self._on_app_unmap)
+        self.root.bind("<Map>", self._on_app_map)
+
         # Initialize buttons via build_config_panel
         self.build_config_panel()
+
+    # --- Sleep mode -----------------------------------------------------
+    #
+    # Tracks whether the app window currently has focus and/or is
+    # minimized. Only counts as "unfocused" when both FocusOut has fired
+    # AND the window isn't in the foreground - Unmap/Map (minimize/
+    # restore) are tracked separately since a minimized window doesn't
+    # reliably emit FocusOut/FocusIn on all platforms/window managers.
+    # Either condition (unfocused or minimized) starts the countdown;
+    # both must clear (focused again AND not minimized) to cancel it.
+
+    def _on_app_focus_out(self, event=None):
+        # Only the root window's own focus matters - child widgets
+        # (dialogs, entries) losing focus to each other shouldn't trigger
+        # this. Tkinter fires FocusOut/FocusIn on the toplevel too, so
+        # filter to events targeting root itself.
+        if event is not None and event.widget is not self.root:
+            return
+        self._app_focused = False
+        self._maybe_start_sleep_timer()
+
+    def _on_app_focus_in(self, event=None):
+        if event is not None and event.widget is not self.root:
+            return
+        self._app_focused = True
+        self._maybe_cancel_sleep_timer_and_wake()
+
+    def _on_app_unmap(self, event=None):
+        if event is not None and event.widget is not self.root:
+            return
+        self._app_minimized = True
+        self._maybe_start_sleep_timer()
+
+    def _on_app_map(self, event=None):
+        if event is not None and event.widget is not self.root:
+            return
+        self._app_minimized = False
+        self._maybe_cancel_sleep_timer_and_wake()
+
+    def _maybe_start_sleep_timer(self):
+        """Arm the sleep countdown if the app is now unfocused/minimized,
+        sleep mode is enabled, and a timer isn't already running."""
+        if self.sleep_mode_minutes <= 0:
+            return
+        if self._is_asleep or self._sleep_timer_id is not None:
+            return
+        if self._app_focused and not self._app_minimized:
+            return
+        delay_ms = int(self.sleep_mode_minutes * 60 * 1000)
+        logging.info(f"Sleep mode: app unfocused/minimized, sleeping in {self.sleep_mode_minutes} min if it stays that way")
+        self._sleep_timer_id = self.root.after(delay_ms, self._enter_sleep_mode)
+
+    def _maybe_cancel_sleep_timer_and_wake(self):
+        """Called when the app regains focus or is restored from minimize.
+        Cancels any pending countdown, and if already asleep, wakes the
+        streams back up."""
+        # Still unfocused/minimized on the other axis - don't wake yet.
+        if not self._app_focused or self._app_minimized:
+            return
+        if self._sleep_timer_id is not None:
+            try:
+                self.root.after_cancel(self._sleep_timer_id)
+            except Exception:
+                pass
+            self._sleep_timer_id = None
+            logging.info("Sleep mode: app refocused before timeout, countdown cancelled")
+        if self._is_asleep:
+            self._wake_from_sleep_mode()
+
+    def _rearm_sleep_mode_timer(self):
+        """Called after config is saved (sleep_mode_minutes may have
+        changed). Cancels any pending timer and re-evaluates from the
+        current focus/minimize state, so raising the value while already
+        unfocused starts a fresh countdown, and setting it to 0 disables
+        the feature immediately."""
+        if self._sleep_timer_id is not None:
+            try:
+                self.root.after_cancel(self._sleep_timer_id)
+            except Exception:
+                pass
+            self._sleep_timer_id = None
+        if self.sleep_mode_minutes <= 0:
+            # Disabled - if we were already asleep, wake immediately so
+            # streams aren't left stopped indefinitely.
+            if self._is_asleep:
+                self._wake_from_sleep_mode()
+            return
+        self._maybe_start_sleep_timer()
+
+    def _enter_sleep_mode(self):
+        """Stop all currently-live (non-archive, non-event-mode) streams
+        and remember which ones were running, so they can be restarted on
+        wake. Archive browsing/playback and event mode are left alone -
+        sleep mode only concerns the always-on live view."""
+        self._sleep_timer_id = None
+
+        # Double-check we're still actually unfocused/minimized - guards
+        # against a race where focus returned just as the timer fired.
+        if self._app_focused and not self._app_minimized:
+            return
+        if self._is_asleep:
+            return
+
+        if self.event_mode:
+            logging.info("Sleep mode: skipping, event mode is active")
+            return
+
+        stopped = []
+        for i in range(4):
+            if self.is_archive_mode[i]:
+                continue
+            if not self.ips[i] or not self.streams[i]:
+                continue
+            if not self.media_players[i] and not self.stream_initializing[i]:
+                continue
+            stopped.append(i)
+
+        if not stopped:
+            logging.info("Sleep mode: no active live streams to stop")
+            self._is_asleep = True
+            self._sleep_stopped_indices = []
+            return
+
+        logging.info(f"Sleep mode: stopping live streams {stopped} after {self.sleep_mode_minutes} min unfocused/minimized")
+        self._is_asleep = True
+        self._sleep_stopped_indices = stopped
+
+        for i in stopped:
+            try:
+                self.cleanup_stream(i)
+            except Exception as e:
+                logging.error(f"Sleep mode: error stopping stream {i}: {e}")
+            self.update_stream_label(i, "Sleeping")
+            if self.fullscreen_buttons[i]:
+                self.root.after(0, lambda idx=i: self.fullscreen_buttons[idx].place_forget())
+
+    def _wake_from_sleep_mode(self):
+        """Restart streams that sleep mode stopped."""
+        if not self._is_asleep:
+            return
+        self._is_asleep = False
+        to_restart = self._sleep_stopped_indices
+        self._sleep_stopped_indices = []
+
+        if not to_restart:
+            return
+
+        logging.info(f"Sleep mode: waking, restarting streams {to_restart}")
+
+        self.root.after(0, self._disable_stream_action_buttons)
+
+        def _restart():
+            threads = [
+                threading.Thread(target=self.try_init_stream_with_retries, args=(i,), daemon=True)
+                for i in to_restart if not self.is_archive_mode[i]
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.root.after(0, self.update_layout)
+            self.root.after(0, self._reenable_stream_action_buttons)
+
+        threading.Thread(target=_restart, daemon=True).start()
 
     def set_audio_state(self, index, mute=True):
         if not self.audio_enabled[index]:
@@ -1914,8 +2257,6 @@ class tapoStreamer:
                 self.media_players[index].audio_set_mute(mute)
             except Exception as e:
                 logging.error(f"Stream {index}: Failed to set python-vlc audio state: {e}")
-        else:
-            pass
 
     def update_stream_label(self, index, text, fg="white", image=""):
         """Update the stream label in a thread-safe manner."""
@@ -1923,6 +2264,17 @@ class tapoStreamer:
             self.root.after(0, lambda: self.labels[index].configure(image=image, text=text, fg=fg))
         except Exception as e:
             logging.error(f"Stream {index}: Failed to update label: {e}")
+
+    def _set_event_blank_label(self, index):
+        """Blank out a cam's label while in event mode (not currently
+        playing a clip). Shows 'Disabled' - matching the normal disabled
+        stream label's color - for cams with no configured IP/stream, or
+        'Cam N' in the dimmed event-mode color otherwise, so a disabled
+        cam doesn't come back from event mode mislabeled as just inactive."""
+        if not self.ips[index] or not self.streams[index]:
+            self.labels[index].configure(image="", text="Disabled", fg="white", bg="black")
+        else:
+            self.labels[index].configure(image="", text=f"Cam {index + 1}", fg="#888888", bg="black")
 
     def try_init_stream_with_retries(self, index):
         # Attempt to initialize a stream with retries, managing all label updates.
@@ -2026,10 +2378,23 @@ class tapoStreamer:
         else:
             args.extend(['--aout=pulse', '--vout=gl'])
         if self.debug_mode:
-            args.append('--verbose=2')
+            # verbose=1 (warnings+errors) instead of 2 (full debug) - level 2
+            # floods the log with per-frame demux/codec chatter from libvlc
+            # itself, which drowns out the app's own debug logging. Anything
+            # actually useful (stream errors, RTSP issues) still comes
+            # through at level 1; _vlc_log_handler also filters to
+            # WARNING+ regardless of this setting.
+            args.append('--verbose=1')
         return args
 
     def _vlc_log_handler(self, data, level, ctx, fmt, args):
+        # LIBVLC levels: 0=DEBUG, 1=NOTICE, 2=WARNING, 3=ERROR. Only forward
+        # WARNING+ to our log - DEBUG/NOTICE from libvlc is per-frame demux
+        # and codec chatter that drowns out the app's own debug logging,
+        # and this filter applies regardless of the --verbose level passed
+        # to the instance.
+        if level < 2:
+            return
         try:
             buf = ctypes.create_string_buffer(2048)
             libc = ctypes.CDLL(None)
@@ -2039,12 +2404,10 @@ class tapoStreamer:
             message = "<unformattable libvlc log message>"
 
         level_map = {
-            0: logging.DEBUG,    # LIBVLC_DEBUG
-            1: logging.INFO,     # LIBVLC_NOTICE
             2: logging.WARNING,  # LIBVLC_WARNING
             3: logging.ERROR,    # LIBVLC_ERROR
         }
-        logging.log(level_map.get(level, logging.DEBUG), f"libvlc: {message}")
+        logging.log(level_map.get(level, logging.WARNING), f"libvlc: {message}")
 
     def attach_vlc_logging(self, instance):
         """Attach the libvlc log callback to an instance, if debug logging
@@ -2347,18 +2710,81 @@ class tapoStreamer:
 
         logging.info(f"Stream {index} monitoring stopped")
 
-    def _disable_stream_action_buttons(self):        
-        # Disable the archive-mode and events buttons on the main thread.
+    def _disable_stream_action_buttons(self, indices=None):
+        # Disable the archive-mode and events buttons on the main thread,
+        # while live streams reinitialize (guards against clicking either
+        # button and racing the new player, which can segfault). Shown
+        # dimmed/inactive unless that mode is actually still active - it
+        # never should be on this path, since this is only reached after
+        # exiting to live, but the check is kept for correctness.
+        #
+        # archive_mode_button and events_button both act on every stream at
+        # once (toggle_all_archive_mode / toggle_event_mode loop all 4
+        # indices), so they must stay disabled for the full duration
+        # regardless of which indices are reinitializing.
+        any_archive_mode = any(self.is_archive_mode[i] for i in range(4))
         if self.archive_mode_button:
-            self.archive_mode_button.configure(state="disabled")
+            self.archive_mode_button.configure(
+                state="disabled",
+                image=self.icon_cache["disk_active"] if any_archive_mode else self.icon_cache["disk_disabled"]
+            )
         if self.events_button:
-            self.events_button.configure(state="disabled")
+            self.events_button.configure(
+                state="disabled",
+                image=self.icon_cache["events_active"] if self.event_mode else self.icon_cache["events_disabled"]
+            )
+        # The fullscreen-specific archive button (self.archive_buttons[i]) is
+        # a separate widget from archive_mode_button above, and is only
+        # otherwise refreshed by build_config_panel() - which doesn't run
+        # synchronously on the archive-exit path. Without this, it would
+        # keep showing its last image (red) for the whole lock duration.
+        #
+        # Unlike the two buttons above, toggle_archive_mode(idx) only ever
+        # touches its own index, so only the indices actually reinitializing
+        # need disabling here - a slow camera on index 2 has no bearing on
+        # whether it's safe to click the fullscreen archive button for
+        # index 0. Defaults to all 4 for callers that don't know/care which
+        # indices are affected (e.g. a blanket disable before scanning).
+        target_indices = range(4) if indices is None else indices
+        for i in target_indices:
+            btn = self.archive_buttons[i]
+            if btn:
+                btn.configure(
+                    state="disabled",
+                    image=self.icon_cache["disk_active"] if self.is_archive_mode[i] else self.icon_cache["disk_disabled"]
+                )
 
-    def _reenable_stream_action_buttons(self):
-        if self.archive_mode_button and self.archive_dir:
-            self.archive_mode_button.configure(state="normal")
-        if self.events_button and self.motion_triggered_events and self.archive_dir:
-            self.events_button.configure(state="normal")
+    def _reenable_stream_action_buttons(self, indices=None):
+        # archive_mode_button and events_button act on every stream at once,
+        # so they're only safe to reenable once nothing anywhere is still
+        # initializing - a caller finishing its own subset of streams
+        # doesn't mean some other in-flight init (from a different call
+        # site) isn't still racing against a fresh player elsewhere.
+        any_initializing = any(self.stream_initializing)
+        any_archive_mode = any(self.is_archive_mode[i] for i in range(4))
+        if not any_initializing:
+            if self.archive_mode_button and self.archive_dir:
+                self.archive_mode_button.configure(
+                    state="normal",
+                    image=self.icon_cache["disk_active"] if any_archive_mode else self.icon_cache["disk"]
+                )
+            if self.events_button and self.motion_triggered_events and self.archive_dir:
+                self.events_button.configure(
+                    state="normal",
+                    image=self.icon_cache["events_active"] if self.event_mode else self.icon_cache["events"]
+                )
+        target_indices = range(4) if indices is None else indices
+        for i in target_indices:
+            # Same reasoning for the per-panel button: only safe to reenable
+            # index i's button once index i itself is no longer initializing.
+            if self.stream_initializing[i]:
+                continue
+            btn = self.archive_buttons[i]
+            if btn:
+                btn.configure(
+                    state="normal",
+                    image=self.icon_cache["disk_active"] if self.is_archive_mode[i] else self.icon_cache["disk"]
+                )
 
     def start_streams(self):
 
@@ -2370,6 +2796,40 @@ class tapoStreamer:
             if self.is_archive_mode[i]:
                 continue
             if self.ips[i]:
+                thread = threading.Thread(target=self.try_init_stream_with_retries, args=(i,), daemon=True)
+                threads.append(thread)
+                thread.start()
+        for thread in threads:
+            thread.join()
+        for i in range(4):
+            # Skip updating target dims for streams in archive mode
+            if self.is_archive_mode[i]:
+                continue
+            if self.media_players[i]:
+                self.root.after(0, lambda idx=i: self.update_target_dims(idx))
+
+        # All inits done — re-enable buttons that are appropriate for the
+        # current config.
+        self.root.after(0, self._reenable_stream_action_buttons)
+
+    def restart_previously_playing_streams(self, was_playing):
+        """Like start_streams, but only reinitializes streams that were
+        actually connected and playing before the config dialog was saved.
+        Used by save_streams so that saving config doesn't force a
+        reconnect on cameras that weren't live (disabled, archive mode,
+        never configured, or already in a failed state) - only ones that
+        were genuinely interrupted by the save get restarted."""
+
+        self.root.after(0, self._disable_stream_action_buttons)
+
+        threads = []
+        for i in range(4):
+            # Skip stream if it's in archive mode
+            if self.is_archive_mode[i]:
+                continue
+            # Only restart streams that were live before the save, and that
+            # still have a valid IP/URL after the new config was applied.
+            if was_playing[i] and self.ips[i] and self.streams[i]:
                 thread = threading.Thread(target=self.try_init_stream_with_retries, args=(i,), daemon=True)
                 threads.append(thread)
                 thread.start()
@@ -2474,9 +2934,24 @@ class tapoStreamer:
 
 
     def toggle_all_archive_mode(self):
-        """Toggle archive mode for all active streams based on current state."""
+        """Toggle archive mode for all active streams based on current state.
+
+        Mode-button semantics (mirrors the Events button):
+          - If Events mode is currently active, close it first, then enter
+            Archive mode (switching between modes).
+          - If Archive mode is currently active, close it (same as right-click).
+          - Otherwise, enter Archive mode.
+        """
         if not self.archive_dir:
             return
+
+        if self.event_mode:
+            # Switching from Events -> Archive: close the event overlay and
+            # coordinated playback first, then fall through to enter archive.
+            # Don't restart live streams here - we're about to put eligible
+            # cams straight into archive mode, and any ineligible cams are
+            # stopped explicitly below.
+            self._exit_event_mode(restart_streams=False)
 
         # Check if any stream is in archive mode
         any_archive_mode = any(self.is_archive_mode[i] for i in range(4))
@@ -2484,14 +2959,34 @@ class tapoStreamer:
         if any_archive_mode:
             for i in range(4):
                 if self.is_archive_mode[i] and not self.archive_transitioning[i]:
-                    self.toggle_archive_mode(i, rebuild_ui=False)
+                    # rebuild_ui=True: let each stream's own exit-archive flow
+                    # rebuild the config panel once its button lock lifts, so
+                    # the archive icon stays red for the full duration of the
+                    # restart (consistent with the Events button's timing)
+                    # rather than flipping white immediately here.
+                    self.toggle_archive_mode(i, rebuild_ui=True)
                     logging.info(f"Stream {i}: Exited archive mode via global toggle")
-            self.build_config_panel()
             return
 
         eligible = [i for i in range(4) if self.streams[i] and not self.is_archive_mode[i]]
         if not eligible:
+            # Nothing to put into archive mode. If we just exited event mode
+            # without restarting streams, restart them now so we don't leave
+            # every cam stopped with no mode active.
+            cams_to_restart = [i for i in range(4) if self.ips[i] and self.streams[i] and not self.media_players[i]]
+            if cams_to_restart:
+                threading.Thread(
+                    target=lambda: [self.try_init_stream_with_retries(i) for i in cams_to_restart],
+                    daemon=True
+                ).start()
             return
+
+        # Explicitly stop every other live stream (mirrors Events mode's
+        # unconditional stop-all-cams behaviour on entry) so no live feed
+        # keeps rendering/decoding behind the archive browser view.
+        for i in range(4):
+            if i not in eligible and not self.is_archive_mode[i] and self.media_players[i]:
+                self.cleanup_stream(i)
 
         for i in eligible:
             if not self.archive_transitioning[i]:
@@ -2499,7 +2994,7 @@ class tapoStreamer:
                 logging.info(f"Stream {i}: Entered archive mode via global toggle")
         self.build_config_panel()
 
-    def toggle_archive_mode(self, index, rebuild_ui=True):
+    def toggle_archive_mode(self, index, rebuild_ui=True, restart_stream=True):
         if not self.archive_dir:
             return
 
@@ -2524,7 +3019,6 @@ class tapoStreamer:
             if rebuild_ui:
                 self.build_config_panel()
 
-            loading_shown = threading.Event()
             if hasattr(self, "nav_buttons") and index < len(self.nav_buttons):
                 for btn in self.nav_buttons[index].values():
                     btn.place_forget()
@@ -2535,34 +3029,47 @@ class tapoStreamer:
                 panel_width // 2, panel_height // 2,
                 text="Loading...", fill="white", font=self.app_font(-16)
             )
-            threading.Thread(target=self._enter_archive_mode_thread, args=(index, loading_shown), daemon=True).start()
+            threading.Thread(target=self._enter_archive_mode_thread, args=(index,), daemon=True).start()
         else:
             with self.archive_entry_locks[index]:
                 self.cleanup_archive_mode(index)
 
-            # Disable both action buttons while this stream re-initializes so
-            # the user can't click archive/events and race against the new player.
-            self._disable_stream_action_buttons()
+            if restart_stream:
+                # Disable both action buttons while this stream re-initializes so
+                # the user can't click archive/events and race against the new
+                # player. The two global buttons (archive_mode_button/
+                # events_button) still cover all 4 indices since they act on
+                # every stream, but the per-panel archive button only needs
+                # to cover this one index.
+                self._disable_stream_action_buttons(indices=[index])
 
-            # Start stream initialization in a separate thread
-            def _init_and_reenable():
-                self.try_init_stream_with_retries(index)
-                self.root.after(0, self._reenable_stream_action_buttons)
+                # Start stream initialization in a separate thread. The
+                # archive icon(s) are dimmed for the duration of the lock
+                # by _disable_stream_action_buttons and only return to
+                # white/active once _reenable_stream_action_buttons runs.
+                def _init_and_reenable():
+                    self.try_init_stream_with_retries(index)
+                    def _on_done():
+                        self._reenable_stream_action_buttons(indices=[index])
+                        if rebuild_ui:
+                            self.build_config_panel()
+                    self.root.after(0, _on_done)
 
-            threading.Thread(target=_init_and_reenable, args=(), daemon=True).start()
-
-            if rebuild_ui:
-                self.build_config_panel()
+                threading.Thread(target=_init_and_reenable, args=(), daemon=True).start()
+            else:
+                logging.info(f"Stream {index}: Archive mode exited without restarting live stream (mode switch)")
+                if rebuild_ui:
+                    self.build_config_panel()
 
             # Exit is fully synchronous from here, so the transition is
             # over now - clear the flag so the next toggle is accepted.
             self.archive_transitioning[index] = False
 
-    def _enter_archive_mode_thread(self, index, loading_shown):
+    def _enter_archive_mode_thread(self, index):
         with self.archive_entry_locks[index]:
-            self._enter_archive_mode_thread_locked(index, loading_shown)
+            self._enter_archive_mode_thread_locked(index)
 
-    def _enter_archive_mode_thread_locked(self, index, loading_shown):
+    def _enter_archive_mode_thread_locked(self, index):
         """Actual body of _enter_archive_mode_thread, called with
         archive_entry_locks[index] already held."""
       
@@ -2581,7 +3088,6 @@ class tapoStreamer:
             exists = False
 
         def finish():
-            loading_shown.set()
             try:
                 if not self.is_archive_mode[index]:
                     # User toggled back out while we were waiting
@@ -3428,13 +3934,36 @@ class tapoStreamer:
         return result
 
     def toggle_event_mode(self):
-        """Toggle between event-mode (overlay + coordinated playback) and live."""
+        """Toggle between event-mode (overlay + coordinated playback) and live.
+
+        Mode-button semantics (mirrors the Archive button):
+          - If Events mode is currently active, close it (same as right-click).
+          - If Archive mode is currently active, close it first, then open
+            Events (switching between modes).
+          - Otherwise, open Events mode.
+        """
         if self.event_mode:
             self._exit_event_mode()
-        else:
-            self._open_event_overlay()
+            return
 
-    def _exit_event_mode(self):
+        if any(self.is_archive_mode[i] for i in range(4)):
+            for i in range(4):
+                if self.is_archive_mode[i] and not self.archive_transitioning[i]:
+                    self.toggle_archive_mode(i, rebuild_ui=False, restart_stream=False)
+                    logging.info(f"Stream {i}: Exited archive mode to switch to Events")
+
+        # Drop back to grid before opening the overlay, whether we got here
+        # from fullscreen archive or fullscreen live - the event listing
+        # centres over the grid area and multi-cam events need all four
+        # panels available to render into.
+        if self.is_fullscreen:
+            self.is_fullscreen = False
+            self.fullscreen_index = -1
+            self.update_layout()
+
+        self._open_event_overlay()
+
+    def _exit_event_mode(self, restart_streams=True):
         # Tear down event mode and return all quadrants to live streams.
         self.event_mode = False
 
@@ -3465,6 +3994,22 @@ class tapoStreamer:
         if self.event_overlay and self.event_overlay.winfo_exists():
             self.event_overlay.destroy()
         self.event_overlay = None
+
+        # Reflect the state flips above (event_mode off, fullscreen reset)
+        # immediately - grid view and the Events/Archive icons must not
+        # wait for the stream restart lock to finish, or the UI stays
+        # showing a single fullscreen cam and a lingering Events icon for
+        # the whole reinit duration, which reads as broken/jarring.
+        self.update_layout()
+        self.build_config_panel()
+
+        if not restart_streams:
+            # Caller (e.g. switching straight to Archive mode) will handle
+            # its own stream state — don't spin the live streams back up
+            # just to tear them down again a moment later.
+            logging.info("Event mode exited without restarting live streams (mode switch)")
+            self.update_label_bindings()
+            return
 
         # All live streams were stopped on entry — restart every configured cam.
         cams_to_restart = [i for i in range(4) if self.ips[i] and self.streams[i]]
@@ -3512,7 +4057,7 @@ class tapoStreamer:
                 self.cleanup_archive_mode(i)
             else:
                 self.cleanup_stream(i)
-            self.labels[i].configure(image="", text=f"Cam {i + 1}", fg="#888888", bg="black")
+            self._set_event_blank_label(i)
 
         # Clear label click bindings now that event_mode is True — prevents
         # a click on a blank quadrant from triggering fullscreen-zoom.
@@ -3937,6 +4482,10 @@ class tapoStreamer:
                 self._event_entered_fullscreen = True
                 self.update_layout()
                 self.build_config_panel()
+        else:
+            # Multi-cam events stay in grid - refresh now so the
+            # back-to-listing button appears as soon as playback starts.
+            self.build_config_panel()
 
         for ci, _, _ in cam_launches:
             if not self.is_archive_mode[ci]:
@@ -3975,7 +4524,7 @@ class tapoStreamer:
             speed = max(1.0, self.playback_speeds[index])
             adjusted_gap_ms = int(gap_ms / speed)
             if adjusted_gap_ms > 0:
-                self.labels[index].configure(image="", text=f"Cam {index + 1}", fg="#888888", bg="black")
+                self._set_event_blank_label(index)
                 _after_id = self.root.after(
                     adjusted_gap_ms,
                     lambda i=index, p=next_path: self.play_archive_video(i, p)
@@ -3989,7 +4538,8 @@ class tapoStreamer:
             for widget in self.labels[index].winfo_children():
                 widget.destroy()
             self._reset_clip_buttons(index)
-            self.labels[index].configure(image="", text=f"Cam {index + 1}", fg="#888888", bg="black")
+            self.is_archive_mode[index] = False
+            self._set_event_blank_label(index)
             self.event_done_cams.add(index)
 
             if self.event_done_cams >= self.event_active_cams:
@@ -4015,6 +4565,11 @@ class tapoStreamer:
                         self.fullscreen_index = -1
                         self._event_entered_fullscreen = False
                         self.update_layout()
+                        self.build_config_panel()
+                    else:
+                        # Multi-cam events stay in grid - still need to
+                        # refresh so the back-to-listing button (only shown
+                        # while a clip is actively playing) is hidden again.
                         self.build_config_panel()
                     ow, oh = getattr(self, "_event_overlay_size", (820, 500))
                     self.event_overlay.place(relx=0.5, rely=0.5, anchor="center", width=ow, height=oh)
@@ -4641,8 +5196,6 @@ class tapoStreamer:
                     return taskbar_height
             except Exception:
                 pass
-        else:
-            pass
         return 0
 
     def cleanup_archive_mode(self, index):
@@ -4715,8 +5268,17 @@ class tapoStreamer:
             pass
 
 
+
     def cleanup(self):
         self.enable_ptz_buttons()
+
+        # Cancel any pending sleep-mode timer.
+        if self._sleep_timer_id is not None:
+            try:
+                self.root.after_cancel(self._sleep_timer_id)
+            except Exception:
+                pass
+            self._sleep_timer_id = None
 
         # Signal all background threads to stop before touching any VLC object.
         self.running = False
