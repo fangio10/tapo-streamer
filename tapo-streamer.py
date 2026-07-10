@@ -1722,15 +1722,50 @@ class tapoStreamer:
                     pass
             self._pending_event_afters.clear()
             # Force-finish every cam that still has an active player.
+            # State bookkeeping that doesn't touch the vlc_frame widget
+            # (queue clearing, done-cam tracking) happens immediately.
+            # Destroying self.labels[i]'s children - which includes the
+            # vlc_frame Tk Frame that VLC is rendering into via
+            # set_xwindow()/set_hwnd() - must NOT happen before VLC's own
+            # teardown (.stop()/.release()) has run against it: on Linux,
+            # destroying that X window first and then having libvlc issue
+            # X requests against the now-gone window ID during its own
+            # teardown raises a BadWindow X error and crashes the app.
+            # So teardown and widget destruction are both moved into the
+            # same background thread, in that order, under
+            # archive_entry_locks[i] - matching the existing
+            # _enter_archive_mode_thread pattern. The lock is essential
+            # here, not optional: on Windows, libvlc's D3D/DirectSound
+            # teardown for an HWND bound via set_hwnd() needs to pump
+            # messages on the HWND-owning (Tk main) thread, so teardown
+            # itself must not run there - but without a lock, repeatedly
+            # cycling event -> listing -> event fast enough can start a
+            # second teardown thread for the same index before the first
+            # has released/nulled the player, causing two threads to call
+            # .release() on the same libvlc handle concurrently, which is
+            # undefined behaviour in libvlc (not a catchable Python
+            # exception) and can hang or crash.
             for i in list(playing):
                 self.event_clip_queues[i] = []   # clear queue so no next-clip is started
                 self.event_done_cams.add(i)
-                self.cleanup_stream(i)
-                for widget in self.labels[i].winfo_children():
-                    widget.destroy()
-                self._reset_clip_buttons(i)
                 self.is_archive_mode[i] = False
+                # Safe to blank the label immediately: this only
+                # reconfigures self.labels[i] itself (text/image), not the
+                # child vlc_frame widget VLC is actually rendering into,
+                # so it doesn't race the X-window teardown ordering issue
+                # described above.
                 self._set_event_blank_label(i)
+
+            def _teardown_players(idxs):
+                for i in idxs:
+                    with self.archive_entry_locks[i]:
+                        self.cleanup_stream(i)
+                        def _finish_ui(idx=i):
+                            for widget in self.labels[idx].winfo_children():
+                                widget.destroy()
+                            self._reset_clip_buttons(idx)
+                        self.root.after(0, _finish_ui)
+            threading.Thread(target=_teardown_players, args=(list(playing),), daemon=True).start()
 
             # All cams are now done — mark event played and re-show overlay
             if self.current_playing_event:
@@ -1926,12 +1961,20 @@ class tapoStreamer:
                 # No PTZ or exit-fullscreen/grid button, regardless of
                 # fullscreen state.
                 any_initializing = any(self.stream_initializing)
-                any_archive_mode = any(self.is_archive_mode[i] for i in range(4))
+                # NOTE: is_archive_mode[i] is also set True for any cam
+                # currently playing an event clip (play_archive_video()
+                # reuses the archive-mode VLC pipeline for clip playback),
+                # so it does not mean "the user turned Archive mode on"
+                # while in event mode - it's just internal plumbing reuse.
+                # Event mode and user-facing Archive mode are mutually
+                # exclusive (see toggle_event_mode/toggle_all_archive_mode),
+                # so the archive button here should just show its normal
+                # inactive/white state rather than lighting up whenever a
+                # clip happens to be playing.
                 if self.archive_dir:
                     self.archive_mode_button.configure(
                         state="disabled" if any_initializing else "normal",
-                        image=(self.icon_cache["disk_active"] if any_archive_mode
-                               else self.icon_cache["disk_disabled"] if any_initializing
+                        image=(self.icon_cache["disk_disabled"] if any_initializing
                                else self.icon_cache["disk"])
                     )
                     self.archive_mode_button.pack(pady=5, padx=10)
@@ -2722,7 +2765,16 @@ class tapoStreamer:
         # once (toggle_all_archive_mode / toggle_event_mode loop all 4
         # indices), so they must stay disabled for the full duration
         # regardless of which indices are reinitializing.
-        any_archive_mode = any(self.is_archive_mode[i] for i in range(4))
+        #
+        # NOTE: is_archive_mode[i] is also set True for any cam currently
+        # playing an event clip (play_archive_video() reuses the
+        # archive-mode VLC pipeline for clip playback), not just for
+        # user-toggled Archive mode. While event mode is active, treat the
+        # archive button as inactive rather than reading is_archive_mode
+        # directly, since real user-facing Archive mode can't be active at
+        # the same time as event mode (see toggle_event_mode /
+        # toggle_all_archive_mode).
+        any_archive_mode = (not self.event_mode) and any(self.is_archive_mode[i] for i in range(4))
         if self.archive_mode_button:
             self.archive_mode_button.configure(
                 state="disabled",
@@ -2761,7 +2813,14 @@ class tapoStreamer:
         # doesn't mean some other in-flight init (from a different call
         # site) isn't still racing against a fresh player elsewhere.
         any_initializing = any(self.stream_initializing)
-        any_archive_mode = any(self.is_archive_mode[i] for i in range(4))
+        # NOTE: is_archive_mode[i] is also set True for any cam currently
+        # playing an event clip (play_archive_video() reuses the
+        # archive-mode VLC pipeline for clip playback), not just for
+        # user-toggled Archive mode. Treat the archive button as inactive
+        # while event mode is active, since real user-facing Archive mode
+        # can't be active at the same time (see toggle_event_mode /
+        # toggle_all_archive_mode).
+        any_archive_mode = (not self.event_mode) and any(self.is_archive_mode[i] for i in range(4))
         if not any_initializing:
             if self.archive_mode_button and self.archive_dir:
                 self.archive_mode_button.configure(
@@ -3031,39 +3090,58 @@ class tapoStreamer:
             )
             threading.Thread(target=self._enter_archive_mode_thread, args=(index,), daemon=True).start()
         else:
-            with self.archive_entry_locks[index]:
-                self.cleanup_archive_mode(index)
+            # VLC teardown (.stop()/.release()) must happen BEFORE the
+            # vlc_frame Tk Frame it's rendering into (a child of
+            # self.labels[index], destroyed by _cleanup_archive_mode_ui)
+            # is torn down: on Linux, destroying that X window first and
+            # then having libvlc's own teardown issue X requests against
+            # the now-gone window ID raises a BadWindow X error and
+            # crashes the app. So both halves run together in the
+            # background thread, in VLC-then-UI order, under
+            # archive_entry_locks[index] - matching the existing
+            # entry-side pattern (_enter_archive_mode_thread). This must
+            # not run synchronously on the Tk main thread either way: on
+            # Windows, libvlc's D3D/DirectSound teardown for an HWND bound
+            # via set_hwnd() needs to pump messages on the HWND-owning
+            # (Tk main) thread, so a blocking teardown call made from that
+            # same thread deadlocks waiting on itself. The lock (not just
+            # the background thread) is what prevents a second toggle on
+            # the same index from starting a concurrent teardown/restart -
+            # without it, two threads could both see a stale
+            # media_players[index] and both call .release() on the same
+            # libvlc handle.
+            def _exit_archive_locked():
+                with self.archive_entry_locks[index]:
+                    self._cleanup_archive_mode_vlc(index)
+                    self.root.after(0, lambda: self._cleanup_archive_mode_ui(index))
 
-            if restart_stream:
-                # Disable both action buttons while this stream re-initializes so
-                # the user can't click archive/events and race against the new
-                # player. The two global buttons (archive_mode_button/
-                # events_button) still cover all 4 indices since they act on
-                # every stream, but the per-panel archive button only needs
-                # to cover this one index.
-                self._disable_stream_action_buttons(indices=[index])
+                    if restart_stream:
+                        # Disable both action buttons while this stream
+                        # re-initializes so the user can't click archive/events
+                        # and race against the new player. The two global
+                        # buttons (archive_mode_button/events_button) still
+                        # cover all 4 indices since they act on every stream,
+                        # but the per-panel archive button only needs to
+                        # cover this one index.
+                        self.root.after(0, lambda: self._disable_stream_action_buttons(indices=[index]))
 
-                # Start stream initialization in a separate thread. The
-                # archive icon(s) are dimmed for the duration of the lock
-                # by _disable_stream_action_buttons and only return to
-                # white/active once _reenable_stream_action_buttons runs.
-                def _init_and_reenable():
-                    self.try_init_stream_with_retries(index)
-                    def _on_done():
-                        self._reenable_stream_action_buttons(indices=[index])
+                        self.try_init_stream_with_retries(index)
+
+                        def _on_done():
+                            self._reenable_stream_action_buttons(indices=[index])
+                            if rebuild_ui:
+                                self.build_config_panel()
+                        self.root.after(0, _on_done)
+                    else:
+                        logging.info(f"Stream {index}: Archive mode exited without restarting live stream (mode switch)")
                         if rebuild_ui:
-                            self.build_config_panel()
-                    self.root.after(0, _on_done)
+                            self.root.after(0, self.build_config_panel)
 
-                threading.Thread(target=_init_and_reenable, args=(), daemon=True).start()
-            else:
-                logging.info(f"Stream {index}: Archive mode exited without restarting live stream (mode switch)")
-                if rebuild_ui:
-                    self.build_config_panel()
+                # Teardown (and restart, if any) for this index is now
+                # fully resolved - accept the next toggle.
+                self.archive_transitioning[index] = False
 
-            # Exit is fully synchronous from here, so the transition is
-            # over now - clear the flag so the next toggle is accepted.
-            self.archive_transitioning[index] = False
+            threading.Thread(target=_exit_archive_locked, daemon=True).start()
 
     def _enter_archive_mode_thread(self, index):
         with self.archive_entry_locks[index]:
@@ -3706,65 +3784,98 @@ class tapoStreamer:
         if self.watch_progress_dirty:
             self.save_watch_progress()
 
-        # Stop video playback and clean up VLC resources
-        self.cleanup_stream(index)
-
-        # Destroy all children of self.labels[index]
-        for widget in self.labels[index].winfo_children():
-            widget.destroy()
-
-        # Reset button refs and playback state
-        self._reset_clip_buttons(index)
+        # Reset button refs and playback state (state-only, no widget
+        # destruction here - see below for why).
         self.playback_speeds[index] = 1.0
         self.is_paused[index] = False
 
-        # Handle navigation
-        if not self.current_archive_path[index]:
-            logging.warning(f"Stream {index}: No current archive path, exiting archive mode")
-            self.toggle_archive_mode(index)
-            return
+        # The blocking VLC teardown (.stop()/.release()), the destruction
+        # of self.labels[index]'s children (including the vlc_frame Tk
+        # Frame VLC is rendering into via set_xwindow()/set_hwnd()), and
+        # everything that follows (deciding whether to navigate up a
+        # folder or exit archive mode, then re-rendering) is moved into a
+        # single background thread that holds archive_entry_locks[index]
+        # for its full duration.
+        #
+        # Widget destruction must happen AFTER cleanup_stream(), not
+        # before: on Linux, destroying vlc_frame's X window first and then
+        # having libvlc's own teardown issue X requests against that
+        # now-gone window ID raises a BadWindow X error and crashes the
+        # app. On Windows, the ordering concern is different but the fix
+        # is the same shape: libvlc's D3D/DirectSound teardown for an
+        # HWND bound via set_hwnd() needs to pump messages on the
+        # HWND-owning (Tk main) thread, so a blocking teardown call there
+        # deadlocks waiting on itself. The navigation/render logic that
+        # follows also stays under the same lock (rather than being fired
+        # separately) because it reuses self.labels[index]/
+        # archive_canvas[index] and can call play_archive_video() again
+        # (via a subsequent click) - letting it run before this teardown
+        # is confirmed done would risk a second thread touching the same
+        # VLC handle concurrently, same hazard the lock exists to prevent.
+        def _go_back_locked():
+            with self.archive_entry_locks[index]:
+                self.cleanup_stream(index)
 
-        # Normalize paths to handle Linux/Windows separators
-        current_path = os.path.normpath(self.current_archive_path[index])
-        archive_dir = os.path.normpath(self.archive_dir)
-        archive_root = os.path.normpath(os.path.join(archive_dir, f"cam{index+1}"))
+                def _navigate():
+                    # Destroy all children of self.labels[index] (the
+                    # vlc_frame Tk Frame, control buttons, etc.) now that
+                    # VLC's own teardown above has already released it -
+                    # safe to do on the main thread here.
+                    for widget in self.labels[index].winfo_children():
+                        widget.destroy()
+                    self._reset_clip_buttons(index)
 
-        # If already at the root folder view, exit archive mode
-        if current_path == archive_root and not current_path.endswith(".mp4"):
-            logging.info(f"Stream {index}: At archive root {current_path}, exiting archive mode")
-            self.toggle_archive_mode(index)
-            return
+                    # Handle navigation
+                    if not self.current_archive_path[index]:
+                        logging.warning(f"Stream {index}: No current archive path, exiting archive mode")
+                        self.toggle_archive_mode(index)
+                        return
 
-        # Determine parent path
-        if current_path.endswith(".mp4"):
-            parent_path = os.path.dirname(current_path)
-        else:
-            parent_path = os.path.dirname(current_path)
+                    # Normalize paths to handle Linux/Windows separators
+                    current_path = os.path.normpath(self.current_archive_path[index])
+                    archive_dir = os.path.normpath(self.archive_dir)
+                    archive_root = os.path.normpath(os.path.join(archive_dir, f"cam{index+1}"))
 
-        # Reset pagination for video listing view (subfolder) when navigating up
-        if current_path != archive_root and not current_path.endswith(".mp4"):
-            self.pagination_state[index][current_path] = 0
-            logging.info(f"Stream {index}: Reset pagination for video listing view {current_path} to page 1")
+                    # If already at the root folder view, exit archive mode
+                    if current_path == archive_root and not current_path.endswith(".mp4"):
+                        logging.info(f"Stream {index}: At archive root {current_path}, exiting archive mode")
+                        self.toggle_archive_mode(index)
+                        return
 
-        # Check if parent_path is still within or equal to archive_dir
-        if not os.path.commonprefix([parent_path, archive_dir]) == archive_dir or parent_path == archive_dir:
-            # Reached or exceeded archive_dir, exit archive mode
-            logging.info(f"Stream {index}: Reached archive_dir boundary, exiting archive mode")
-            self.toggle_archive_mode(index)
-            return
-        else:
-            # Update to parent directory
-            self.current_archive_path[index] = parent_path
-            parent_path = os.path.normpath(parent_path)
-            if parent_path not in self.pagination_state[index]:
-                self.pagination_state[index][parent_path] = 0
-            logging.info(f"Stream {index}: Navigated back to {self.current_archive_path[index]}")
+                    # Determine parent path
+                    if current_path.endswith(".mp4"):
+                        parent_path = os.path.dirname(current_path)
+                    else:
+                        parent_path = os.path.dirname(current_path)
 
-        # Restore archive view
-        self.is_archive_mode[index] = True
-        self.labels[index].pack_forget()
-        self.archive_canvas[index].pack(fill="both", expand=True)
-        self.render_archive_view(index)
+                    # Reset pagination for video listing view (subfolder) when navigating up
+                    if current_path != archive_root and not current_path.endswith(".mp4"):
+                        self.pagination_state[index][current_path] = 0
+                        logging.info(f"Stream {index}: Reset pagination for video listing view {current_path} to page 1")
+
+                    # Check if parent_path is still within or equal to archive_dir
+                    if not os.path.commonprefix([parent_path, archive_dir]) == archive_dir or parent_path == archive_dir:
+                        # Reached or exceeded archive_dir, exit archive mode
+                        logging.info(f"Stream {index}: Reached archive_dir boundary, exiting archive mode")
+                        self.toggle_archive_mode(index)
+                        return
+                    else:
+                        # Update to parent directory
+                        self.current_archive_path[index] = parent_path
+                        norm_parent_path = os.path.normpath(parent_path)
+                        if norm_parent_path not in self.pagination_state[index]:
+                            self.pagination_state[index][norm_parent_path] = 0
+                        logging.info(f"Stream {index}: Navigated back to {self.current_archive_path[index]}")
+
+                    # Restore archive view
+                    self.is_archive_mode[index] = True
+                    self.labels[index].pack_forget()
+                    self.archive_canvas[index].pack(fill="both", expand=True)
+                    self.render_archive_view(index)
+
+                self.root.after(0, _navigate)
+
+        threading.Thread(target=_go_back_locked, daemon=True).start()
 
     def _events_dir(self):
         # Return the base directory where per-day event JSON files are stored.
@@ -3980,10 +4091,44 @@ class tapoStreamer:
             self.fullscreen_index = -1
             self._event_entered_fullscreen = False
 
-        # Clean up any active archive-mode playback (event clips in progress).
-        for i in list(self.event_active_cams):
-            if self.is_archive_mode[i]:
-                self.cleanup_archive_mode(i)
+        # Clean up any active archive-mode playback (event clips in
+        # progress). VLC teardown (.stop()/.release()) must run BEFORE
+        # the vlc_frame Tk Frame it renders into is destroyed: on Linux,
+        # destroying that X window first and then having libvlc's own
+        # teardown issue X requests against the now-gone window ID raises
+        # a BadWindow X error and crashes the app. So both halves run
+        # together in the background, VLC-then-UI, under
+        # archive_entry_locks[i] - matching toggle_archive_mode's exit
+        # branch and go_back. This must not run synchronously here
+        # either way: on Windows, libvlc's D3D/DirectSound teardown for
+        # an HWND bound via set_hwnd() needs to pump messages on the
+        # HWND-owning (Tk main) thread, so a blocking teardown call from
+        # that same thread deadlocks waiting on itself. Repeatedly
+        # cycling event -> listing -> event fast enough is exactly the
+        # case that needs the lock: without it, a stream restart for the
+        # same index (below) could start reinitializing before the prior
+        # teardown released the old VLC handle.
+        archive_cams_to_teardown = [i for i in list(self.event_active_cams) if self.is_archive_mode[i]]
+
+        # Flip is_archive_mode to False immediately (a plain state flag,
+        # safe to touch from here) rather than leaving it for the
+        # backgrounded _cleanup_archive_mode_ui() to reset later. This
+        # matters because build_config_panel() runs synchronously just
+        # below (see comment there for why it can't wait on the teardown
+        # thread) - if is_archive_mode[i] were still True at that point,
+        # the archive button would incorrectly render as active/red for
+        # cams that were only playing an event clip, not real user-toggled
+        # Archive mode, until the deferred reset eventually caught up.
+        for i in archive_cams_to_teardown:
+            self.is_archive_mode[i] = False
+
+        def _teardown_archive_players(idxs):
+            for i in idxs:
+                with self.archive_entry_locks[i]:
+                    self._cleanup_archive_mode_vlc(i)
+                    self.root.after(0, lambda idx=i: self._cleanup_archive_mode_ui(idx))
+        if archive_cams_to_teardown:
+            threading.Thread(target=_teardown_archive_players, args=(archive_cams_to_teardown,), daemon=True).start()
 
         self.event_active_cams  = set()
         self.event_done_cams    = set()
@@ -4018,9 +4163,23 @@ class tapoStreamer:
             self.root.after(0, self._disable_stream_action_buttons)
 
             def _restart_all():
+                def _restart_one(idx):
+                    # If this index just had its VLC resources torn down
+                    # above (archive_cams_to_teardown), wait for that
+                    # teardown thread to fully release the lock before
+                    # reinitializing - otherwise this could start a fresh
+                    # VLC instance on the same index while the old one is
+                    # still being released, another route to the same
+                    # concurrent-.release() hazard the lock exists to
+                    # prevent. For indices that weren't in archive mode,
+                    # this lock is uncontended and just acts as a normal
+                    # per-index critical section, same as everywhere else.
+                    with self.archive_entry_locks[idx]:
+                        self.try_init_stream_with_retries(idx)
+
                 threads = [
                     threading.Thread(
-                        target=self.try_init_stream_with_retries,
+                        target=_restart_one,
                         args=(i,),
                         daemon=True
                     )
@@ -4052,12 +4211,45 @@ class tapoStreamer:
         self.event_mode = True
         self.build_config_panel()   # re-pack to reflect active state
 
-        for i in range(4):
-            if self.is_archive_mode[i]:
-                self.cleanup_archive_mode(i)
-            else:
-                self.cleanup_stream(i)
-            self._set_event_blank_label(i)
+        # VLC teardown (.stop()/.release(), via cleanup_stream) must run
+        # BEFORE any archive-mode vlc_frame Tk Frame it renders into is
+        # destroyed: on Linux, destroying that X window first and then
+        # having libvlc's own teardown issue X requests against the
+        # now-gone window ID raises a BadWindow X error and crashes the
+        # app. So the archive-mode UI reset for indices that need it is
+        # deferred into the same background thread as the VLC teardown,
+        # after cleanup_stream() completes for that index - matching the
+        # pattern used by toggle_archive_mode's exit branch, go_back, and
+        # _exit_event_mode.
+        #
+        # _set_event_blank_label() must ALSO be deferred until after
+        # cleanup_stream() for that index, not called up front: for a
+        # live (non-archive) stream, video is rendered directly into
+        # self.labels[index]'s own X window (via set_xwindow()/
+        # set_hwnd()), not a separate child widget. If the label's text
+        # is set before the live player is actually stopped, the still-
+        # running player keeps painting video frames over that same
+        # window and the "Cam N" text either never becomes visible or is
+        # immediately overwritten - it only sticks once the player has
+        # genuinely stopped rendering. This must not run synchronously
+        # here either way: on Windows, libvlc's D3D/DirectSound teardown
+        # for an HWND bound via set_hwnd() needs to pump messages on the
+        # HWND-owning (Tk main) thread, so calling it synchronously here
+        # can deadlock, and the lock prevents this teardown from racing a
+        # concurrent one for the same index (e.g. a fast exit-events /
+        # re-enter-events click).
+        teardown_indices = list(range(4))
+        was_archive_mode = {i: self.is_archive_mode[i] for i in teardown_indices}
+
+        def _teardown_all(idxs):
+            for i in idxs:
+                with self.archive_entry_locks[i]:
+                    if self.media_players[i]:
+                        self.cleanup_stream(i)
+                    if was_archive_mode[i]:
+                        self.root.after(0, lambda idx=i: self._cleanup_archive_mode_ui(idx))
+                    self.root.after(0, lambda idx=i: self._set_event_blank_label(idx))
+        threading.Thread(target=_teardown_all, args=(teardown_indices,), daemon=True).start()
 
         # Clear label click bindings now that event_mode is True — prevents
         # a click on a blank quadrant from triggering fullscreen-zoom.
@@ -5199,11 +5391,30 @@ class tapoStreamer:
         return 0
 
     def cleanup_archive_mode(self, index):
-        # Clean up archive mode state and UI for the specified stream index.
-        try:
-            if self.media_players[index]:
-                self.cleanup_stream(index)
+        # Combined UI + VLC teardown for the specified stream index. This
+        # calls cleanup_stream() (blocking .stop()/.release()) directly on
+        # whatever thread it's called from, so it is only safe to call
+        # from a background thread that already holds
+        # archive_entry_locks[index] - see the entry-side pattern in
+        # _enter_archive_mode_thread, and the exit-side patterns in
+        # toggle_archive_mode, go_back, _exit_event_mode, and
+        # _open_event_overlay, all of which use the split
+        # _cleanup_archive_mode_ui() / _cleanup_archive_mode_vlc() halves
+        # below instead of calling this combined method directly.
+        # Not currently called anywhere in this file - kept as a
+        # convenience wrapper for future callers that already hold the
+        # lock on a background thread. Callers on the Tk main thread must
+        # NOT call this directly: on Windows, libvlc's D3D/DirectSound
+        # teardown for an HWND bound via set_hwnd() needs to pump messages
+        # on the HWND-owning (Tk main) thread, so a blocking teardown call
+        # made from that same thread deadlocks waiting on itself.
+        self._cleanup_archive_mode_ui(index)
+        self._cleanup_archive_mode_vlc(index)
 
+    def _cleanup_archive_mode_ui(self, index):
+        # Tk widget/state-only half of archive mode cleanup. Always safe
+        # to call directly on the main thread - does no VLC work.
+        try:
             # Destroy all child widgets in self.labels[index]
             for widget in self.labels[index].winfo_children():
                 widget.destroy()
@@ -5230,7 +5441,20 @@ class tapoStreamer:
             self.labels[index].pack(fill="both", expand=True)
 
         except Exception as e:
-            logging.error(f"Stream {index}: Failed to clean up archive mode: {e}")
+            logging.error(f"Stream {index}: Failed to clean up archive mode UI: {e}")
+
+    def _cleanup_archive_mode_vlc(self, index):
+        # VLC-only half of archive mode cleanup (.stop()/.release() via
+        # cleanup_stream). Must be called either from a background thread
+        # holding archive_entry_locks[index], or from app shutdown's own
+        # teardown thread - see the comment on cleanup_archive_mode above
+        # for why calling this from the Tk main thread can deadlock on
+        # Windows.
+        try:
+            if self.media_players[index]:
+                self.cleanup_stream(index)
+        except Exception as e:
+            logging.error(f"Stream {index}: Failed to clean up archive mode VLC resources: {e}")
 
     def cleanup_config_panel(self):
         try:
