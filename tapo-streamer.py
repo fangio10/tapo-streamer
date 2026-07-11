@@ -3,9 +3,11 @@ import tkinter as tk
 from tkinter import ttk
 import tkinter.font as tkfont
 import tkinter.messagebox as messagebox
+import tkinter.filedialog as filedialog
 import re
 import json
 import os
+import shutil
 import threading
 from threading import Timer
 import time
@@ -61,7 +63,6 @@ class tapoStreamer:
     DEFAULT_VLC_PARAMS = [
         "--avcodec-hw=any",
         "--network-caching=3000",
-        "--deinterlace=auto"
     ]
 
     @classmethod
@@ -280,6 +281,17 @@ class tapoStreamer:
         self.stream_init_lock = threading.Lock()
         self.stream_cleanup_events = [threading.Event() for _ in range(4)]
         self.archive_entry_locks = [threading.Lock() for _ in range(4)]
+        # Indices whose VLC teardown (cleanup_stream via
+        # _cleanup_archive_mode_vlc) has been kicked off on a background
+        # thread but not yet confirmed complete. is_archive_mode[i] can be
+        # flipped to False slightly ahead of the actual teardown finishing
+        # (see _exit_event_mode) so cosmetic UI like the archive button
+        # icon updates immediately - but update_layout()'s hwnd/xwindow
+        # rebind must NOT treat that index as a plain live stream until
+        # its media_players[i] is confirmed to be the real live player,
+        # not a stale event/archive clip player still mid-release on
+        # another thread. See update_layout() and _cleanup_archive_mode_vlc().
+        self.pending_vlc_teardown = set()
         self.archive_transitioning = [False] * 4
         self.media_players = [None] * 4
         self.streams = [""] * 4
@@ -301,7 +313,11 @@ class tapoStreamer:
         self.archive_mode_button = None
         self.archive_mode_image = None
         self.current_archive_path = [None] * 4
-        self.playback_speeds = [1.0] * 4
+        # Playback speed is global - it applies to every clip playing in
+        # archive/event mode at once, rather than per-quadrant. Seeded from
+        # the configured default; cycling it (via the speed button) updates
+        # this single value and re-applies the rate to every active player.
+        self.global_playback_speed = self.default_playback_speed
         self.is_paused = [False] * 4
         self.video_ended = [False] * 4
         self.pagination_state = [{} for _ in range(4)]
@@ -309,12 +325,16 @@ class tapoStreamer:
         self.config_button = None
         self.ptz_buttons = []
         self.ptz_images = []
+        # Global speed-cycle button (archive/event clip playback) - lives in
+        # the config_panel below the active mode button, not per-quadrant.
+        self.speed_toggle_button = None
+        self.speed_toggle_image = None
         self.archive_buttons = [None] * 4
         self.archive_canvas = [None] * 4
         self.back_buttons = [None] * 4
         self.exit_buttons = [None] * 4
         self.pause_buttons = [None] * 4
-        self.speed_buttons = [None] * 4
+        self.ff_buttons = [None] * 4
         self.replay_buttons = [None] * 4
         self.rewind_buttons = [None] * 4
         self.audio_buttons = [None] * 4
@@ -336,6 +356,14 @@ class tapoStreamer:
         self.event_done_cams = set()
         self.event_overlay = None
         self.current_playing_event = None
+        # Each entry is a dict: {"kind", "after_id", "index", "path",
+        # "unscaled_ms", "scheduled_at", "scheduled_speed"}. "kind" is
+        # either "clip_launch" (a delayed next-clip start) or "ramp_step"
+        # (a brief post-start speed step-up, path is None) - kept as a
+        # dict (not just the bare after_id) so a mid-wait speed change can
+        # cancel + reschedule the remaining delay against the new speed
+        # instead of firing at a delay computed under the old (stale)
+        # speed. See cycle_speed() and _reschedule_pending_event_afters().
         self._pending_event_afters = []
         self.events_button = None
         self.events_button_image = None
@@ -389,6 +417,7 @@ class tapoStreamer:
             "events": self.create_icon("events"),
             "list": self.create_icon("list"),
             "delete": self.create_icon("delete"),
+            "download": self.create_icon("download"),
             "audio_on": self.create_icon("audio_on"),
             "audio_off": self.create_icon("audio_off"),
         }
@@ -405,6 +434,7 @@ class tapoStreamer:
         self.icon_cache["events_disabled"] = self.dim_icon(self.icon_cache["events"])
 
         self.day_folder_icon_cache = {}
+        self.speed_icon_cache = {}
         self.thumbnail_cache = {}
         self.thumbnail_cache_order = []
         self.thumbnail_cache_max = 200
@@ -1264,6 +1294,10 @@ class tapoStreamer:
         except (ValueError, TypeError):
             logging.warning(f"Invalid default_playback_speed input, using default 1.0")
             self.default_playback_speed = 1.0
+        # Keep the live global speed control in sync with the new default -
+        # no clips are cycling through save_streams (config dialog is
+        # modal), so it's safe to just reset it here.
+        self.global_playback_speed = self.default_playback_speed
 
         # Save new stream reliability settings
         self.enable_retries = enable_retries_var.get()
@@ -1496,6 +1530,9 @@ class tapoStreamer:
             draw.rectangle((12, 8, 18, 32), fill="white")
             draw.rectangle((22, 8, 28, 32), fill="white")
         elif icon_type == "speed":
+            # Double-chevron - shared shape for both fast-forward (per-clip
+            # skip) and, mirrored, rewind. Kept as-is; only its assigned
+            # button/purpose changed (was speed-cycle, now fast-forward).
             draw.polygon([(10, 8), (20, 20), (10, 32)], fill="white")
             draw.polygon([(20, 8), (30, 20), (20, 32)], fill="white")
         elif icon_type == "replay":
@@ -1553,6 +1590,11 @@ class tapoStreamer:
             draw.line([(17, 18), (17, 28)], fill="white", width=1)
             draw.line([(20, 18), (20, 28)], fill="white", width=1)
             draw.line([(23, 18), (23, 28)], fill="white", width=1)
+        elif icon_type == "download":
+            # Down arrow into a tray - standard download glyph
+            draw.line([(20, 8), (20, 24)], fill="white", width=3)
+            draw.polygon([(12, 18), (28, 18), (20, 28)], fill="white")
+            draw.line([(9, 32), (31, 32)], fill="white", width=3)
         elif icon_type == "audio_on":
             # Speaker with sound waves
             draw.polygon([(10, 14), (10, 26), (16, 26), (22, 32), (22, 8), (16, 14)], fill="white")
@@ -1661,6 +1703,62 @@ class tapoStreamer:
         self.day_folder_icon_cache[cache_key] = photo
         return photo
 
+    def get_speed_icon(self, multiplier):
+        """Return a (cached) icon for the global playback-speed button: a
+        play triangle with a small 'Nx' text badge showing the current
+        speed - shown even at 1x, so the button reads as "play at this
+        speed" rather than a plain play button."""
+        cached = self.speed_icon_cache.get(multiplier)
+        if cached is not None:
+            return cached
+
+        size = (40, 40)
+        img = Image.new("RGBA", size, (0, 0, 0, 255))
+        draw = ImageDraw.Draw(img)
+
+        # Play triangle (same shape/position as the "play" icon type)
+        draw.polygon([(12, 8), (32, 20), (12, 32)], outline="white", width=2, fill="white")
+
+        if multiplier:
+            label = f"{int(multiplier)}x" if float(multiplier).is_integer() else f"{multiplier}x"
+
+            font = None
+            for font_path in (
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                "DejaVuSans-Bold.ttf",
+                "arialbd.ttf",
+            ):
+                try:
+                    font = ImageFont.truetype(font_path, 11)
+                    break
+                except Exception:
+                    continue
+            if font is None:
+                font = ImageFont.load_default()
+
+            try:
+                bbox = draw.textbbox((0, 0), label, font=font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+            except Exception:
+                text_w, text_h = draw.textsize(label, font=font)
+
+            # Badge sits bottom-right, with a small dark backing so the
+            # digits stay legible over the white triangle/black background
+            # either way.
+            pad_x, pad_y = 2, 1
+            badge_x1 = 40 - text_w - pad_x * 2 - 1
+            badge_y1 = 40 - text_h - pad_y * 2 - 3
+            badge_x2 = 39
+            badge_y2 = 39
+            draw.rectangle((badge_x1, badge_y1, badge_x2, badge_y2), fill=(0, 0, 0, 255))
+            draw.text((badge_x1 + pad_x, badge_y1 + pad_y - bbox[1]), label, fill="#e62117", font=font)
+
+        photo = ImageTk.PhotoImage(img)
+        self.speed_icon_cache[multiplier] = photo
+        return photo
+
     def bind_stream_label(self, index):
         # Bind the label for a given stream based on its state.
         try:
@@ -1715,9 +1813,9 @@ class tapoStreamer:
         if playing:
             # Cancel any pending delayed clip launches before stopping
             # players so no new playback starts after cleanup.
-            for _after_id in self._pending_event_afters:
+            for _pending in self._pending_event_afters:
                 try:
-                    self.root.after_cancel(_after_id)
+                    self.root.after_cancel(_pending["after_id"])
                 except Exception:
                     pass
             self._pending_event_afters.clear()
@@ -1749,6 +1847,14 @@ class tapoStreamer:
                 self.event_clip_queues[i] = []   # clear queue so no next-clip is started
                 self.event_done_cams.add(i)
                 self.is_archive_mode[i] = False
+                # Not yet torn down (that happens on the background thread
+                # below) - mark pending so update_layout()'s hwnd/xwindow
+                # rebind (which can run synchronously just below, via
+                # self.update_layout() in the fullscreen-exit branch)
+                # doesn't treat this index as a fresh live player and
+                # rebind the still-live event-clip player before it's
+                # actually released.
+                self.pending_vlc_teardown.add(i)
                 # Safe to blank the label immediately: this only
                 # reconfigures self.labels[i] itself (text/image), not the
                 # child vlc_frame widget VLC is actually rendering into,
@@ -1760,6 +1866,7 @@ class tapoStreamer:
                 for i in idxs:
                     with self.archive_entry_locks[i]:
                         self.cleanup_stream(i)
+                        self.pending_vlc_teardown.discard(i)
                         def _finish_ui(idx=i):
                             for widget in self.labels[idx].winfo_children():
                                 widget.destroy()
@@ -1893,6 +2000,14 @@ class tapoStreamer:
                     command=self._return_to_event_listing, cursor="hand2"
                 )
 
+            if not self.speed_toggle_button:
+                self.speed_toggle_image = self.get_speed_icon(self.global_playback_speed)
+                self.speed_toggle_button = tk.Button(
+                    self.config_panel, image=self.speed_toggle_image, bg="#222222", bd=0,
+                    activebackground="#222222", relief="flat",
+                    command=self.cycle_speed, cursor="hand2"
+                )
+
             for i in range(4):
                 if not self.fullscreen_buttons[i]:
                     img = self.icon_cache["fullscreen"]
@@ -1914,6 +2029,7 @@ class tapoStreamer:
             for button in self.ptz_buttons + [self.exit_fullscreen_button, self.config_button, self.archive_mode_button] + \
                           ([self.events_button] if self.events_button else []) + \
                           ([self.event_back_button] if self.event_back_button else []) + \
+                          ([self.speed_toggle_button] if self.speed_toggle_button else []) + \
                           [b for b in self.archive_buttons if b] + [b for b in self.fullscreen_buttons if b]:
                 button.pack_forget()
                 if button in self.fullscreen_buttons:
@@ -1932,6 +2048,13 @@ class tapoStreamer:
                         image=self.icon_cache["disk_active"] if self.is_archive_mode[self.fullscreen_index] else self.icon_cache["disk"]
                     )
                     self.archive_buttons[self.fullscreen_index].pack(pady=5, padx=10)
+                # Global speed control - only relevant while a clip is
+                # actually playing (not while just browsing the archive
+                # folder tree), so gate on media_players rather than
+                # is_archive_mode alone.
+                if self.is_archive_mode[self.fullscreen_index] and self.media_players[self.fullscreen_index]:
+                    self.speed_toggle_button.configure(image=self.get_speed_icon(self.global_playback_speed))
+                    self.speed_toggle_button.pack(pady=5, padx=10)
                 if ptz_enabled:
                     for button in self.ptz_buttons:
                         button.pack(pady=5, padx=10)
@@ -1988,6 +2111,8 @@ class tapoStreamer:
                 # listing overlay itself is already visible otherwise.
                 if self.event_active_cams - self.event_done_cams:
                     self.event_back_button.pack(pady=5, padx=10)
+                    self.speed_toggle_button.configure(image=self.get_speed_icon(self.global_playback_speed))
+                    self.speed_toggle_button.pack(pady=5, padx=10)
                 self.config_button.pack(pady=10, padx=10)
             else:
                 any_initializing = any(self.stream_initializing)
@@ -2001,6 +2126,15 @@ class tapoStreamer:
                                else self.icon_cache["disk"])
                     )
                     self.archive_mode_button.pack(pady=5, padx=10)
+                # Global speed control - only relevant while at least one
+                # cam is actually playing a clip in grid mode (not just
+                # browsing the archive folder tree in a quadrant).
+                any_clip_playing = any(
+                    self.is_archive_mode[i] and self.media_players[i] for i in range(4)
+                )
+                if any_clip_playing:
+                    self.speed_toggle_button.configure(image=self.get_speed_icon(self.global_playback_speed))
+                    self.speed_toggle_button.pack(pady=5, padx=10)
                 # Pack events button in grid mode if motion_triggered_events is on
                 if self.motion_triggered_events and self.archive_dir:
                     self.events_button.configure(
@@ -2403,16 +2537,25 @@ class tapoStreamer:
             with self.stream_init_lock:
                 self.stream_initializing[index] = False
 
-    def build_vlc_instance_args(self, extra_args=None):
+    def build_vlc_instance_args(self, extra_args=None, allow_frame_drop=False):
         """Build the common libvlc instance argument list, with optional
-        per-call extra args (e.g. archive-specific caching flags). """
+        per-call extra args (e.g. archive-specific caching flags).
+
+        allow_frame_drop=False (default, used for live streams) keeps
+        --no-skip-frames: never sacrifice picture quality on the live feed.
+        allow_frame_drop=True (used for archive/event clip playback) omits
+        it, letting VLC drop non-essential frames to keep up - this is
+        what actually lets 4x/8x play back smoothly instead of stuttering,
+        since --no-skip-frames forces every frame to be decoded regardless
+        of playback rate, and decode throughput can't keep up with 4x/8x
+        on many systems/streams."""
         args = [
             '--no-video-title-show',
             '--rtsp-tcp',
-            '--no-skip-frames',
-            '--network-caching=2000',
             '--no-plugins-cache',
         ]
+        if not allow_frame_drop:
+            args.append('--no-skip-frames')
         if extra_args:
             args.extend(extra_args)
         args.extend(self.vlcparams)
@@ -2482,9 +2625,7 @@ class tapoStreamer:
         frame_times = []
 
         try:
-            instance = vlc.Instance(self.build_vlc_instance_args(
-                ['--live-caching=2000']
-            ))
+            instance = vlc.Instance(self.build_vlc_instance_args())
             if not instance:
                 raise RuntimeError("Failed to create VLC instance")
             self.attach_vlc_logging(instance)
@@ -2941,7 +3082,20 @@ class tapoStreamer:
                     self.panels[i].place(x=0, y=0, width=w, height=h)
                     self.panel_sizes[i] = (w, h)
                     self.update_target_dims(i)
-                    if not self.is_archive_mode[i] and self.media_players[i]:
+                    if (not self.is_archive_mode[i] and self.media_players[i]
+                            and i not in self.pending_vlc_teardown):
+                        # pending_vlc_teardown guards against rebinding a
+                        # stale player that's still mid-release on a
+                        # background thread: is_archive_mode[i] can flip to
+                        # False slightly ahead of the actual VLC teardown
+                        # completing (see _exit_event_mode,
+                        # toggle_archive_mode, _return_to_event_listing),
+                        # and without this check this would call
+                        # set_hwnd()/set_xwindow() on the OLD event/archive
+                        # clip player as if it were a fresh live stream -
+                        # which is what caused a lingering clip frame that
+                        # never actually transitioned to the real live
+                        # stream after exiting event mode.
                         hwnd = self.labels[i].winfo_id()
                         self.media_players[i].set_hwnd(hwnd) if sys.platform.startswith("win") else self.media_players[i].set_xwindow(hwnd)
                 else:
@@ -3068,6 +3222,16 @@ class tapoStreamer:
         self.is_archive_mode[index] = not self.is_archive_mode[index]
         logging.info(f"Stream {index}: Archive mode {'enabled' if self.is_archive_mode[index] else 'disabled'}")
 
+        if not self.is_archive_mode[index]:
+            # Flipped to False just now, but VLC teardown for this index
+            # hasn't happened yet (it's about to be kicked off below on a
+            # background thread) - mark it pending so update_layout()
+            # doesn't treat media_players[index] as a fresh live player and
+            # rebind it before the old archive/event clip player is
+            # actually released. Cleared once _cleanup_archive_mode_vlc
+            # completes, in _exit_archive_locked below.
+            self.pending_vlc_teardown.add(index)
+
         if self.is_archive_mode[index]:
             self.labels[index].pack_forget()
             self.archive_canvas[index].pack(fill="both", expand=True)
@@ -3113,6 +3277,7 @@ class tapoStreamer:
             def _exit_archive_locked():
                 with self.archive_entry_locks[index]:
                     self._cleanup_archive_mode_vlc(index)
+                    self.pending_vlc_teardown.discard(index)
                     self.root.after(0, lambda: self._cleanup_archive_mode_ui(index))
 
                     if restart_stream:
@@ -3157,6 +3322,12 @@ class tapoStreamer:
         if self.stream_initializing[index]:
             logging.warning(f"Stream {index}: Init did not stop within timeout, proceeding anyway")
         self.cleanup_stream(index)
+        # This may have just torn down a lingering event-clip player left
+        # pending by _exit_event_mode(restart_streams=False) (Events ->
+        # Archive mode switch) - clear the flag now that it's genuinely
+        # released, so update_layout()'s rebind guard doesn't stay blocked
+        # for this index indefinitely.
+        self.pending_vlc_teardown.discard(index)
 
         root_path = os.path.normpath(os.path.join(self.archive_dir, f"cam{index+1}"))
         try:
@@ -3647,18 +3818,33 @@ class tapoStreamer:
         self._stop_hover_poll(index)
         self.exit_buttons[index]   = None
         self.pause_buttons[index]  = None
-        self.speed_buttons[index]  = None
+        self.ff_buttons[index]     = None
         self.replay_buttons[index] = None
         self.rewind_buttons[index] = None
         self.audio_buttons[index]  = None
         self.video_ended[index]    = False
 
     def _clip_control_widgets(self, index):
+        """Return the clip-control buttons that should be shown for the
+        current mode. In event mode, only exit/back (which is rerouted to
+        "skip to this cam's next queued clip" via go_back ->
+        _on_event_clip_ended, not a real exit) and the audio toggle make
+        sense - rewind, pause, fast-forward, and replay would each break
+        this cam out of sync with the rest of the event (which plays on a
+        shared, pre-computed timeline - see _schedule_event_clip_launch/
+        _collapse_dead_air), and there is no mechanism to re-sync a
+        manually seeked/paused cam back to the group afterward. Regular
+        archive browsing (event_mode False) still gets the full set."""
+        if self.event_mode:
+            return [
+                self.exit_buttons[index],
+                self.audio_buttons[index],
+            ]
         return [
             self.exit_buttons[index],
             self.rewind_buttons[index],
             self.pause_buttons[index],
-            self.speed_buttons[index],
+            self.ff_buttons[index],
             self.replay_buttons[index],
             self.audio_buttons[index],
         ]
@@ -3669,12 +3855,16 @@ class tapoStreamer:
         "bottom-left", "bottom-center", "bottom-right",
     ]
 
-    def _clip_control_positions(self):
-        """Return a list of place() kwargs dicts for each of the 6 clip-control
-        buttons, computed from self.controls_position."""
+    def _clip_control_positions(self, n_buttons=6):
+        """Return a list of place() kwargs dicts for n_buttons clip-control
+        buttons, computed from self.controls_position. n_buttons defaults
+        to 6 (full archive-browsing control set) but is passed explicitly
+        by _set_clip_controls_visible to match however many buttons are
+        actually being shown - event mode only shows 2 (exit, audio), and
+        sizing the strip to 6 slots regardless would leave a large empty
+        gap where rewind/pause/ff/replay used to sit."""
         btn_w, btn_h = 40, 40
-        n_buttons = 6
-        strip_w = n_buttons * btn_w   # 240 px
+        strip_w = n_buttons * btn_w
         margin = 10
         pos = getattr(self, 'controls_position', 'top-left')
 
@@ -3709,19 +3899,34 @@ class tapoStreamer:
             result.append(kw)
         return result
 
+    def _all_clip_control_widgets(self, index):
+        """The full set of 6 clip-control buttons regardless of mode - used
+        only when hiding, so a mode change that happens while controls are
+        visible can't strand a button that was placed under the previous
+        mode's (larger) widget set. place_forget() on an already-unplaced
+        widget is a harmless no-op."""
+        return [
+            self.exit_buttons[index],
+            self.rewind_buttons[index],
+            self.pause_buttons[index],
+            self.ff_buttons[index],
+            self.replay_buttons[index],
+            self.audio_buttons[index],
+        ]
+
     def _set_clip_controls_visible(self, index, visible):
         """Show/hide the clip-playback control buttons for a stream. Cheap
         no-op if already in the requested state."""
         if self._clip_controls_visible[index] == visible:
             return
         self._clip_controls_visible[index] = visible
-        widgets = self._clip_control_widgets(index)
         if visible:
-            for widget, kw in zip(widgets, self._clip_control_positions()):
+            widgets = self._clip_control_widgets(index)
+            for widget, kw in zip(widgets, self._clip_control_positions(len(widgets))):
                 if widget:
                     widget.place(**kw)
         else:
-            for widget in widgets:
+            for widget in self._all_clip_control_widgets(index):
                 if widget:
                     widget.place_forget()
 
@@ -3785,8 +3990,8 @@ class tapoStreamer:
             self.save_watch_progress()
 
         # Reset button refs and playback state (state-only, no widget
-        # destruction here - see below for why).
-        self.playback_speeds[index] = 1.0
+        # destruction here - see below for why). Playback speed itself is
+        # global now, so it isn't reset when leaving a clip.
         self.is_paused[index] = False
 
         # The blocking VLC teardown (.stop()/.release()), the destruction
@@ -4078,9 +4283,9 @@ class tapoStreamer:
         # Tear down event mode and return all quadrants to live streams.
         self.event_mode = False
 
-        for _after_id in self._pending_event_afters:
+        for _pending in self._pending_event_afters:
             try:
-                self.root.after_cancel(_after_id)
+                self.root.after_cancel(_pending["after_id"])
             except Exception:
                 pass
         self._pending_event_afters.clear()
@@ -4112,23 +4317,43 @@ class tapoStreamer:
 
         # Flip is_archive_mode to False immediately (a plain state flag,
         # safe to touch from here) rather than leaving it for the
-        # backgrounded _cleanup_archive_mode_ui() to reset later. This
-        # matters because build_config_panel() runs synchronously just
-        # below (see comment there for why it can't wait on the teardown
-        # thread) - if is_archive_mode[i] were still True at that point,
-        # the archive button would incorrectly render as active/red for
-        # cams that were only playing an event clip, not real user-toggled
-        # Archive mode, until the deferred reset eventually caught up.
+        # deferred teardown to reset later. This matters because
+        # build_config_panel() runs synchronously just below (see comment
+        # there for why it can't wait on the teardown) - if is_archive_mode[i]
+        # were still True at that point, the archive button would
+        # incorrectly render as active/red for cams that were only playing
+        # an event clip, not real user-toggled Archive mode, until the
+        # deferred reset eventually caught up.
+        #
+        # NOTE: the actual VLC teardown for these indices does NOT happen
+        # here as a separately-launched thread anymore. It used to, but
+        # that meant two independently-scheduled thread pools - one doing
+        # teardown, one doing the live-stream restart below - only shared
+        # a per-index lock, which prevents them running CONCURRENTLY but
+        # does nothing to guarantee teardown happens BEFORE restart for
+        # the same index. A restart thread could win the race for its
+        # lock before the teardown thread ever got to that index (e.g.
+        # teardown was still working through an earlier index in its
+        # sequential loop), starting a fresh live stream while the old
+        # event-clip VLC player for that same index was still fully alive
+        # and rendering - exactly what caused a cam exiting event mode to
+        # intermittently get stuck showing a lingering clip frame that
+        # never actually became a live stream.
+        #
+        # The fix: teardown for these indices is folded directly into
+        # _restart_one's own critical section below (when restart_streams
+        # is True), so there is only ever ONE thread handling the full
+        # teardown-then-restart sequence per index, in guaranteed order.
+        # For the restart_streams=False case (switching straight to
+        # Archive mode), toggle_archive_mode's own entry path
+        # (_enter_archive_mode_thread_locked) already calls
+        # cleanup_stream() itself under the same lock before setting up
+        # the archive browser, so no separate teardown is needed there
+        # either - it was actually redundant even before this race was
+        # found.
         for i in archive_cams_to_teardown:
             self.is_archive_mode[i] = False
-
-        def _teardown_archive_players(idxs):
-            for i in idxs:
-                with self.archive_entry_locks[i]:
-                    self._cleanup_archive_mode_vlc(i)
-                    self.root.after(0, lambda idx=i: self._cleanup_archive_mode_ui(idx))
-        if archive_cams_to_teardown:
-            threading.Thread(target=_teardown_archive_players, args=(archive_cams_to_teardown,), daemon=True).start()
+            self.pending_vlc_teardown.add(i)
 
         self.event_active_cams  = set()
         self.event_done_cams    = set()
@@ -4162,19 +4387,39 @@ class tapoStreamer:
             # Disable both action buttons immediately.
             self.root.after(0, self._disable_stream_action_buttons)
 
+            archive_teardown_set = set(archive_cams_to_teardown)
+
             def _restart_all():
                 def _restart_one(idx):
-                    # If this index just had its VLC resources torn down
-                    # above (archive_cams_to_teardown), wait for that
-                    # teardown thread to fully release the lock before
-                    # reinitializing - otherwise this could start a fresh
-                    # VLC instance on the same index while the old one is
-                    # still being released, another route to the same
-                    # concurrent-.release() hazard the lock exists to
-                    # prevent. For indices that weren't in archive mode,
-                    # this lock is uncontended and just acts as a normal
-                    # per-index critical section, same as everywhere else.
+                    # CRITICAL ORDERING NOTE: acquiring archive_entry_locks[idx]
+                    # here only guarantees this restart won't run
+                    # CONCURRENTLY with that index's teardown - it does NOT
+                    # guarantee this restart runs AFTER it. A separately
+                    # launched thread trying to acquire the same lock can
+                    # win the race and start reinitializing the stream
+                    # before the teardown thread (below) ever gets around
+                    # to that index, especially when teardown is handling
+                    # several indices sequentially in one thread while
+                    # every restart gets its own thread launched up front.
+                    # That's exactly what caused an event clip's old VLC
+                    # player to sometimes still be alive and rendering when
+                    # a fresh live stream tried to take over the same
+                    # index - the two operations were only mutually
+                    # exclusive, never properly ordered.
+                    #
+                    # The actual fix: for any index that needs archive/event
+                    # teardown, run that teardown INLINE, on this same
+                    # thread, immediately before the restart - so there is
+                    # only ever one thread touching this index's VLC
+                    # resources across the whole teardown-then-restart
+                    # sequence, with a guaranteed order, rather than two
+                    # independently scheduled thread pools that merely
+                    # don't overlap.
                     with self.archive_entry_locks[idx]:
+                        if idx in archive_teardown_set:
+                            self._cleanup_archive_mode_vlc(idx)
+                            self.pending_vlc_teardown.discard(idx)
+                            self.root.after(0, lambda i=idx: self._cleanup_archive_mode_ui(i))
                         self.try_init_stream_with_retries(idx)
 
                 threads = [
@@ -4437,8 +4682,9 @@ class tapoStreamer:
 
             rows_frame.unbind("<Configure>")
 
-            play_img   = self.icon_cache["play"]
-            delete_img = self.icon_cache["delete"]
+            play_img     = self.icon_cache["play"]
+            download_img = self.icon_cache["download"]
+            delete_img   = self.icon_cache["delete"]
 
             for ev_idx, ev in enumerate(evs):
                 row_bg = "#1e1e1e" if ev_idx % 2 == 0 else "#232323"
@@ -4447,6 +4693,9 @@ class tapoStreamer:
 
                 pb = tk.Label(row_f, image=play_img, bg=row_bg, cursor="hand2")
                 pb.pack(side="left", padx=(6, 2), pady=4)
+
+                dlb = tk.Label(row_f, image=download_img, bg=row_bg, cursor="hand2")
+                dlb.pack(side="left", padx=(2, 2), pady=4)
 
                 db = tk.Label(row_f, image=delete_img, bg=row_bg, cursor="hand2")
                 db.pack(side="left", padx=(2, 8), pady=4)
@@ -4462,8 +4711,20 @@ class tapoStreamer:
                 tk.Label(row_f, text=time_txt, bg=row_bg, fg="white",
                          font=self.app_font(10), width=16, anchor="w").pack(side="left")
 
-                # Editable event label
-                label_var = tk.StringVar(value=ev.get("label", ""))
+                # Editable event label - defaults to the event's detection
+                # type(s) (e.g. "Person", "Person, Vehicle") when the user
+                # hasn't set a custom label yet. This default is display-only:
+                # it's never written back into the event's stored "label"
+                # unless the user actually edits the field (see _save_label),
+                # so an event with no custom label keeps showing its current
+                # detection types even if they're rescanned/changed later.
+                stored_label = ev.get("label", "")
+                if stored_label:
+                    initial_label = stored_label
+                else:
+                    types_present = self._event_detection_types(ev)
+                    initial_label = ", ".join(self.detection_type_label(t) for t in types_present) if types_present else ""
+                label_var = tk.StringVar(value=initial_label)
                 label_entry = tk.Entry(
                     row_f, textvariable=label_var, width=16,
                     bg="#2a2a2a", fg="white", insertbackground="white",
@@ -4534,9 +4795,12 @@ class tapoStreamer:
                         _refresh_filter_options(state["events"], preserve_selection=True)
                         _render_rows(_filtered_events())
 
+                def _download(event_ref=ev):
+                    self._download_event_clips(event_ref)
+
                 # Click and hover bindings for the Label-based icons.
                 HOVER_BG = "#2e2e2e"
-                for lbl, fn in ((pb, _play), (db, _delete)):
+                for lbl, fn in ((pb, _play), (dlb, _download), (db, _delete)):
                     lbl.bind("<Button-1>",  lambda e, f=fn:     f())
                     lbl.bind("<Enter>",     lambda e, l=lbl:    l.configure(bg=HOVER_BG))
                     lbl.bind("<Leave>",     lambda e, l=lbl, b=row_bg: l.configure(bg=b))
@@ -4573,6 +4837,83 @@ class tapoStreamer:
 
         # Show the panel
         _place_overlay()
+
+    def _download_event_clips(self, event):
+        """Copy every clip from this event's currently-enabled cameras
+        (same selection the Play button uses) to a user-chosen local
+        folder. Filenames are prefixed with "camN_" since clip filenames
+        are timestamp-based with no camera identifier, and two cams can
+        genuinely produce identically-named files for an overlapping
+        event - a flat destination folder without this prefix would let
+        one silently overwrite the other."""
+        clip_sources = []  # list of (cam_index, source_path)
+        for cam_key, cam_data in event.get("cams", {}).items():
+            if not cam_data.get("enabled"):
+                continue
+            for clip in cam_data.get("clips", []):
+                path = clip.get("path")
+                if path:
+                    clip_sources.append((int(cam_key), path))
+
+        if not clip_sources:
+            messagebox.showwarning(
+                "No Cameras Selected",
+                "Enable at least one camera checkbox before downloading.",
+                parent=self.root
+            )
+            return
+
+        dest_dir = filedialog.askdirectory(
+            title="Choose folder to save event clips",
+            parent=self.root
+        )
+        if not dest_dir:
+            return  # User cancelled
+
+        threading.Thread(
+            target=self._copy_event_clips_thread,
+            args=(clip_sources, dest_dir),
+            daemon=True
+        ).start()
+
+    def _copy_event_clips_thread(self, clip_sources, dest_dir):
+        """Background-thread worker: copies each (cam_index, source_path)
+        into dest_dir as "camN_<original filename>", tolerating individual
+        file failures (e.g. a clip that's been deleted from the archive
+        since the event was scanned) rather than aborting the whole batch.
+        Reports a summary back on the Tk main thread when done."""
+        copied = 0
+        failed = []
+
+        for cam_index, source_path in clip_sources:
+            try:
+                original_name = os.path.basename(source_path)
+                dest_name = f"cam{cam_index}_{original_name}"
+                dest_path = os.path.join(dest_dir, dest_name)
+                shutil.copy2(source_path, dest_path)
+                copied += 1
+                logging.info(f"Event download: copied {source_path} -> {dest_path}")
+            except Exception as e:
+                logging.error(f"Event download: failed to copy {source_path}: {e}")
+                failed.append(os.path.basename(source_path))
+
+        def _report():
+            if failed:
+                failed_list = "\n".join(failed[:10])
+                more = f"\n...and {len(failed) - 10} more" if len(failed) > 10 else ""
+                messagebox.showwarning(
+                    "Download Completed with Errors",
+                    f"Copied {copied} of {len(clip_sources)} clip(s) to:\n{dest_dir}\n\n"
+                    f"Failed to copy:\n{failed_list}{more}",
+                    parent=self.root
+                )
+            else:
+                messagebox.showinfo(
+                    "Download Complete",
+                    f"Copied {copied} clip(s) to:\n{dest_dir}",
+                    parent=self.root
+                )
+        self.root.after(0, _report)
 
     def _transfer_archive_audio(self, index):
         # Give audio exclusively to index (archive or event clip playback) -
@@ -4612,7 +4953,7 @@ class tapoStreamer:
         except Exception:
             event_start_dt = None
 
-        cam_launches = []  # list of (ci, first_path, delay_ms)
+        cam_launches = []  # list of (ci, first_path, unscaled_delay_ms)
 
         for cam_key, cam_data in event["cams"].items():
             if not cam_data.get("enabled"):
@@ -4638,19 +4979,25 @@ class tapoStreamer:
             self.event_clip_queues[ci] = queue
             self.event_active_cams.add(ci)
 
-            speed = max(1.0, self.default_playback_speed)
+            # Store the UNSCALED delay (real elapsed time between the
+            # event's overall start and this cam's first clip) - it's
+            # divided by the current speed only at the point we actually
+            # schedule the after() call, not baked in here. This matters
+            # because the user can change speed between this calculation
+            # and _start_event_playback's launch loop below, or - more
+            # importantly - while this wait is already ticking down (see
+            # cycle_speed's rescheduling of self._pending_event_afters).
             if event_start_dt is not None:
                 try:
                     clip_start_dt = datetime.strptime(clips[0]["clip_start"], "%Y-%m-%dT%H:%M:%S")
-                    delay_s = max(0.0, (clip_start_dt - event_start_dt).total_seconds())
-                    delay_ms = int(delay_s * 1000 / speed)
+                    unscaled_delay_ms = int(max(0.0, (clip_start_dt - event_start_dt).total_seconds()) * 1000)
                 except Exception:
-                    delay_ms = 0
+                    unscaled_delay_ms = 0
             else:
-                delay_ms = 0
+                unscaled_delay_ms = 0
 
             first_path, _ = self.event_clip_queues[ci].pop(0)
-            cam_launches.append((ci, first_path, delay_ms))
+            cam_launches.append((ci, first_path, unscaled_delay_ms))
 
         if not self.event_active_cams:
             # Nothing to play — re-show overlay immediately
@@ -4688,16 +5035,11 @@ class tapoStreamer:
         for ci, _, _ in cam_launches:
             self.archive_audio_muted[ci] = True
 
-        for ci, first_path, delay_ms in cam_launches:
-            if delay_ms == 0:
+        for ci, first_path, unscaled_delay_ms in cam_launches:
+            if unscaled_delay_ms == 0:
                 self.play_archive_video(ci, first_path)
             else:
-                logging.info(f"Cam {ci + 1}: delaying event playback start by {delay_ms}ms")
-                _after_id = self.root.after(
-                    delay_ms,
-                    lambda c=ci, p=first_path: self.play_archive_video(c, p)
-                )
-                self._pending_event_afters.append(_after_id)
+                self._schedule_event_clip_launch(ci, first_path, unscaled_delay_ms)
               
     def _on_event_clip_ended(self, index):
         # Called (on main thread via root.after) when a clip finishes in event mode.
@@ -4706,22 +5048,20 @@ class tapoStreamer:
 
         if self.event_clip_queues[index]:
 
-            next_path, gap_ms = self.event_clip_queues[index].pop(0)
+            next_path, unscaled_gap_ms = self.event_clip_queues[index].pop(0)
 
             self.cleanup_stream(index)
             for widget in self.labels[index].winfo_children():
                 widget.destroy()
             self._reset_clip_buttons(index)
 
-            speed = max(1.0, self.playback_speeds[index])
-            adjusted_gap_ms = int(gap_ms / speed)
-            if adjusted_gap_ms > 0:
+            if unscaled_gap_ms > 0:
                 self._set_event_blank_label(index)
-                _after_id = self.root.after(
-                    adjusted_gap_ms,
-                    lambda i=index, p=next_path: self.play_archive_video(i, p)
-                )
-                self._pending_event_afters.append(_after_id)
+                self._schedule_event_clip_launch(index, next_path, unscaled_gap_ms)
+                # If this cam finishing was the last one still playing,
+                # every remaining wait is now just dead air (blank grid) -
+                # collapse it down to whichever clip is due soonest.
+                self._collapse_dead_air()
             else:
                 self.play_archive_video(index, next_path)
         else:
@@ -4733,6 +5073,12 @@ class tapoStreamer:
             self.is_archive_mode[index] = False
             self._set_event_blank_label(index)
             self.event_done_cams.add(index)
+
+            # This cam finishing (with no more clips of its own) may have
+            # been the last one still playing - if so, any other cams
+            # still waiting on a future clip are now just staring at dead
+            # air, so collapse it the same way as the branch above.
+            self._collapse_dead_air()
 
             if self.event_done_cams >= self.event_active_cams:
                 # All cams finished — mark played and restore overlay
@@ -4766,6 +5112,167 @@ class tapoStreamer:
                     ow, oh = getattr(self, "_event_overlay_size", (820, 500))
                     self.event_overlay.place(relx=0.5, rely=0.5, anchor="center", width=ow, height=oh)
                     self.event_overlay.lift()
+
+    def _any_event_clip_playing(self):
+        """True if at least one cam currently has a clip actively playing
+        in event mode (as opposed to waiting for its next clip, or having
+        finished). Used to detect "dead air" - a stretch where every
+        active cam is between clips and the grid is just showing 4 blank
+        quadrants - so those gaps can be collapsed instead of played out
+        in real time."""
+        for i in (self.event_active_cams - self.event_done_cams):
+            if self.media_players[i] and self.is_archive_mode[i]:
+                return True
+        return False
+
+    def _collapse_dead_air(self):
+        """If nothing is currently playing anywhere, jump straight to
+        whichever pending clip is due soonest, shifting every other
+        pending clip_launch wait back by that same amount so all the
+        relative offsets between cams/clips stay exactly as accurate as
+        before - only the shared idle time (where the grid was just
+        showing blank quadrants) gets removed. Only acts on "clip_launch"
+        entries; ramp_step entries are unaffected and left to fire on
+        their own short schedule."""
+        if self._any_event_clip_playing():
+            return
+
+        launches = [p for p in self._pending_event_afters if p["kind"] == "clip_launch"]
+        if not launches:
+            return
+
+        now = time.time()
+        # Remaining UNSCALED wait for each pending launch, given its own
+        # scheduled speed/time - same math as _reschedule_pending_event_afters.
+        remaining = {}
+        for entry in launches:
+            elapsed_real_ms = (now - entry["scheduled_at"]) * 1000 * entry["scheduled_speed"]
+            remaining[id(entry)] = max(0.0, entry["unscaled_ms"] - elapsed_real_ms)
+
+        shortest_ms = min(remaining.values())
+        if shortest_ms <= 0:
+            # Something's already due - let it fire naturally rather than
+            # racing a reschedule against its own pending after() callback.
+            return
+
+        others = [p for p in self._pending_event_afters if p["kind"] != "clip_launch"]
+        self._pending_event_afters = others
+
+        for entry in launches:
+            try:
+                self.root.after_cancel(entry["after_id"])
+            except Exception:
+                pass
+            new_unscaled_ms = max(0.0, remaining[id(entry)] - shortest_ms)
+            if new_unscaled_ms <= 0:
+                self._fire_event_clip_launch(entry["index"], entry["path"])
+            else:
+                self._schedule_event_clip_launch(entry["index"], entry["path"], new_unscaled_ms)
+
+        logging.info(
+            f"Event playback: collapsed {int(shortest_ms)}ms of dead air "
+            f"(no clip playing) across {len(launches)} pending clip(s)"
+        )
+
+    def _schedule_event_clip_launch(self, index, video_path, unscaled_delay_ms):
+        """Schedule an event clip to start after unscaled_delay_ms of REAL
+        elapsed time, divided by whatever playback speed is active right
+        now. The unscaled value (and the speed/time this was scheduled
+        under) is kept in self._pending_event_afters so that if the user
+        changes speed while this wait is still ticking down, cycle_speed()
+        can cancel and reschedule the remaining wait against the new
+        speed - otherwise a wait started at 1x and left running would
+        still fire at its original (much later) 1x wall-clock time even
+        after the user bumped to 8x, which is exactly what made 8x look
+        broken/stuck for multi-clip events."""
+        speed = max(1.0, self.global_playback_speed)
+        actual_delay_ms = max(0, int(unscaled_delay_ms / speed))
+
+        after_id = self.root.after(
+            actual_delay_ms,
+            lambda i=index, p=video_path: self._fire_event_clip_launch(i, p)
+        )
+        self._pending_event_afters.append({
+            "kind": "clip_launch",
+            "after_id": after_id,
+            "index": index,
+            "path": video_path,
+            "unscaled_ms": unscaled_delay_ms,
+            "scheduled_at": time.time(),
+            "scheduled_speed": speed,
+        })
+        logging.info(
+            f"Cam {index + 1}: delaying next event clip by {actual_delay_ms}ms "
+            f"({unscaled_delay_ms}ms unscaled at x{speed})"
+        )
+
+    def _fire_event_clip_launch(self, index, video_path):
+        """Callback for the after() scheduled above - drops the matching
+        entry from _pending_event_afters (it's about to fire, so it's no
+        longer "pending") and starts the clip."""
+        self._pending_event_afters = [
+            p for p in self._pending_event_afters
+            if not (p["kind"] == "clip_launch" and p["index"] == index and p["path"] == video_path)
+        ]
+        self.play_archive_video(index, video_path)
+
+    def _ramp_to_speed(self, index, target_speed):
+        """Callback for the brief low-rate head start given to a freshly
+        started event clip at high speed (see play_archive_video) - steps
+        the player up to the actual target speed once its decoder has had
+        a moment to build some headroom. Drops its own tracking entry from
+        _pending_event_afters first."""
+        self._pending_event_afters = [
+            p for p in self._pending_event_afters
+            if not (p["kind"] == "ramp_step" and p["index"] == index)
+        ]
+        if self.media_players[index] and self.is_archive_mode[index] and not self.is_paused[index]:
+            try:
+                self.media_players[index].set_rate(target_speed)
+                logging.info(f"Stream {index}: Ramped up to x{target_speed} after decoder warm-up")
+            except Exception as e:
+                logging.error(f"Stream {index}: Error ramping up playback speed: {e}")
+
+    def _reschedule_pending_event_afters(self):
+        """Called by cycle_speed() whenever the global speed changes.
+        Cancels every still-pending delayed event-clip launch and
+        reschedules the REMAINING wait (not the full original wait)
+        against the new speed, so a speed change mid-wait is reflected
+        immediately instead of only affecting clips that haven't been
+        scheduled yet. Ramp-step entries (the brief low-rate warm-up
+        before a fresh clip reaches full speed) are simply fired early
+        rather than time-scaled, since they aren't proportional to the
+        unscaled clip-timeline gaps the way clip launches are."""
+        if not self._pending_event_afters:
+            return
+
+        pending = self._pending_event_afters
+        self._pending_event_afters = []
+
+        for entry in pending:
+            try:
+                self.root.after_cancel(entry["after_id"])
+            except Exception:
+                pass
+
+            if entry["kind"] == "ramp_step":
+                # Speed changed before the warm-up window elapsed - just
+                # apply the (now possibly different) global speed right
+                # away rather than waiting out the rest of the warm-up.
+                self._ramp_to_speed(entry["index"], self.global_playback_speed)
+                continue
+
+            # How much of the original (unscaled) wait was already used up,
+            # in real elapsed time, under the speed it was scheduled at.
+            elapsed_real_ms = (time.time() - entry["scheduled_at"]) * 1000 * entry["scheduled_speed"]
+            remaining_unscaled_ms = max(0, entry["unscaled_ms"] - elapsed_real_ms)
+
+            if remaining_unscaled_ms <= 0:
+                # The wait had already effectively elapsed - fire it right
+                # away rather than dropping the clip launch entirely.
+                self._fire_event_clip_launch(entry["index"], entry["path"])
+            else:
+                self._schedule_event_clip_launch(entry["index"], entry["path"], remaining_unscaled_ms)
 
     def play_archive_video(self, index, video_path):
         self.is_archive_mode[index] = True
@@ -4813,16 +5320,19 @@ class tapoStreamer:
             )
             self.pause_buttons[index].image = pause_img
 
-            speed_img = self.icon_cache["speed"]
-            self.speed_buttons[index] = tk.Button(
+            # Fast-forward (skip +10s) - the per-clip partner to rewind
+            # below. Speed cycling is now a single global control (see
+            # speed_toggle_button in the config panel), not per-clip.
+            ff_img = self.icon_cache["speed"]
+            self.ff_buttons[index] = tk.Button(
                 self.labels[index],
-                image=speed_img,
+                image=ff_img,
                 bg="#222222",
                 bd=0,
                 cursor="hand2",
-                command=lambda: self.cycle_speed(index)
+                command=lambda: self.forward_video(index)
             )
-            self.speed_buttons[index].image = speed_img
+            self.ff_buttons[index].image = ff_img
 
             replay_img = self.icon_cache["replay"]
             self.replay_buttons[index] = tk.Button(
@@ -4873,8 +5383,8 @@ class tapoStreamer:
             vlc_frame.destroy()
             return
 
-        # Reset playback state
-        self.playback_speeds[index] = 1.0
+        # Reset playback state (speed itself is global - not reset here,
+        # new clips pick up whatever self.global_playback_speed currently is)
         self.is_paused[index] = False
         self.video_ended[index] = False
 
@@ -4885,7 +5395,7 @@ class tapoStreamer:
         try:
             xid = vlc_frame.winfo_id()
             instance = vlc.Instance(self.build_vlc_instance_args(
-                ['--no-drop-late-frames']
+                allow_frame_drop=True
             ))
             if instance is None:
                 logging.error(f"Stream {index}: Failed to create VLC instance for archive video")
@@ -4908,7 +5418,6 @@ class tapoStreamer:
             player.set_hwnd(xid) if sys.platform.startswith("win") else player.set_xwindow(xid)
             event_manager = player.event_manager()
             playing_event = threading.Event()
-            self.playback_speeds[index] = self.default_playback_speed
 
             def on_playing():
                 playing_event.set()
@@ -4930,7 +5439,49 @@ class tapoStreamer:
             while time.time() - start_time < timeout:
                 if playing_event.is_set():
                     self.set_audio_state(index, mute=self.archive_audio_muted[index])
-                    self.media_players[index].set_rate(self.default_playback_speed)
+
+                    # Ramping into high speed: starting a clip that's
+                    # freshly spinning up its own decoder directly at
+                    # 4x/8x, WHILE several other cams' decoders are also
+                    # mid-flight in the same event, is what was pushing
+                    # libvlc's avcodec decoder into its own "more than 5
+                    # seconds of late video" bailout - it measures lateness
+                    # from when decode begins, so a brand-new decoder under
+                    # concurrent CPU pressure can fall behind that threshold
+                    # before it ever gets a chance to catch up, and the
+                    # decoder responds by dropping almost the whole clip to
+                    # resync rather than gracefully catching up.
+                    #
+                    # Giving the clip a brief moment at a lower rate first
+                    # - only when the target is 4x/8x AND more than one cam
+                    # is concurrently active in event mode, since a single
+                    # clip (archive browsing, or a lone event cam) already
+                    # plays cleanly at any speed - lets its decoder build a
+                    # few seconds of headroom before the full rate is
+                    # demanded, instead of starting the race already behind.
+                    target_speed = self.global_playback_speed
+                    ramp_needed = (
+                        target_speed >= 4.0
+                        and self.event_mode
+                        and len(self.event_active_cams - self.event_done_cams) > 1
+                    )
+                    if ramp_needed:
+                        self.media_players[index].set_rate(2.0)
+                        _ramp_after_id = self.root.after(
+                            800,
+                            lambda i=index, s=target_speed: self._ramp_to_speed(i, s)
+                        )
+                        self._pending_event_afters.append({
+                            "kind": "ramp_step",
+                            "after_id": _ramp_after_id,
+                            "index": index,
+                            "path": None,   # not a clip launch - see kind
+                            "unscaled_ms": 0,
+                            "scheduled_at": time.time(),
+                            "scheduled_speed": target_speed,
+                        })
+                    else:
+                        self.media_players[index].set_rate(target_speed)
                     # Resume from saved position only in archive browse mode.
                     # Event playback always starts from the beginning of each
                     # clip so consecutive clips play in full regardless of
@@ -4945,7 +5496,7 @@ class tapoStreamer:
                                     logging.info(f"Stream {index}: Resumed playback at {resume_at:.1f}s")
                                 except Exception as e:
                                     logging.warning(f"Stream {index}: Failed to seek to saved position: {e}")
-                    threading.Thread(target=self.monitor_vlc_playback, args=(index,), daemon=True).start()
+                    threading.Thread(target=self.monitor_vlc_playback, args=(index, player), daemon=True).start()
                     self.root.after(0, lambda i=index: self._start_hover_poll(i))
                     logging.info(f"Stream {index}: Started python-vlc playback for archive video")
                     break
@@ -4968,7 +5519,6 @@ class tapoStreamer:
 
     def toggle_pause(self, index):
         self.is_paused[index] = not self.is_paused[index]
-        self.playback_speeds[index] = 1.0
 
         new_icon = self.icon_cache["play" if self.is_paused[index] else "pause"]
         self.pause_buttons[index].configure(image=new_icon)
@@ -4977,8 +5527,11 @@ class tapoStreamer:
         if self.media_players[index]:
             try:
                 self.media_players[index].pause()
-                self.media_players[index].set_rate(1.0)
-                logging.info(f"Stream {index} {'paused' if self.is_paused[index] else 'resumed'} at 1x speed")
+                # Playback speed is global and unaffected by pausing - only
+                # resume at the current global rate, don't force 1x.
+                if not self.is_paused[index]:
+                    self.media_players[index].set_rate(self.global_playback_speed)
+                logging.info(f"Stream {index} {'paused' if self.is_paused[index] else 'resumed'} at {self.global_playback_speed}x speed")
             except Exception as e:
                 logging.error(f"Error toggling pause for stream {index}: {e}")
 
@@ -5016,102 +5569,177 @@ class tapoStreamer:
 
         logging.info(f"Stream {index}: Archive audio {'muted' if new_muted else 'unmuted'}")
 
+    def _resume_after_seek(self, index):
+        """Shared post-seek bookkeeping for rewind/forward: keep the
+        current global playback rate (rather than forcing 1x), and if the
+        clip was paused, resume it and flip the pause icon back."""
+        if self.media_players[index]:
+            self.media_players[index].set_rate(self.global_playback_speed)
+        if self.is_paused[index]:
+            self.media_players[index].play()
+            self.is_paused[index] = False
+            new_icon = self.icon_cache["pause"]
+            self.pause_buttons[index].configure(image=new_icon)
+            self.pause_buttons[index].image = new_icon
+
     def rewind_video(self, index):
         if not self.current_archive_path[index]:
             logging.warning(f"Stream {index}: No video path set for rewind")
             return
-
-        self.playback_speeds[index] = 1.0
 
         if self.media_players[index] and not self.video_ended[index]:
             try:
                 current_time = self.media_players[index].get_time()
                 new_time = max(0, current_time - 10000)
                 self.media_players[index].set_time(new_time)
-                self.media_players[index].set_rate(1.0)
-                if self.is_paused[index]:
-                    self.media_players[index].play()
-                    self.is_paused[index] = False
-                    new_icon = self.icon_cache["pause"]
-                self.pause_buttons[index].configure(image=new_icon)
-                self.pause_buttons[index].image = new_icon
-                logging.info(f"Stream {index}: Rewound video by 10 seconds to {new_time/1000:.1f}s at 1x speed")
+                self._resume_after_seek(index)
+                logging.info(f"Stream {index}: Rewound video by 10 seconds to {new_time/1000:.1f}s")
             except Exception as e:
                 logging.error(f"Error rewinding video for stream {index}: {e}")
         else:
             self.play_archive_video(index, self.current_archive_path[index])
-            logging.info(f"Stream {index}: Video ended, restarted for rewind at 1x speed")
+            logging.info(f"Stream {index}: Video ended, restarted for rewind")
+
+    def forward_video(self, index):
+        """Skip the current clip forward by 10 seconds. Per-clip partner
+        to rewind_video - playback speed itself is controlled globally via
+        the speed toggle button, not here."""
+        if not self.current_archive_path[index]:
+            logging.warning(f"Stream {index}: No video path set for fast-forward")
+            return
+
+        if self.media_players[index] and not self.video_ended[index]:
+            try:
+                current_time = self.media_players[index].get_time()
+                duration = self.media_players[index].get_length()
+                new_time = current_time + 10000
+                if duration and duration > 0:
+                    new_time = min(new_time, max(0, duration - 500))
+                self.media_players[index].set_time(new_time)
+                self._resume_after_seek(index)
+                logging.info(f"Stream {index}: Skipped video forward by 10 seconds to {new_time/1000:.1f}s")
+            except Exception as e:
+                logging.error(f"Error fast-forwarding video for stream {index}: {e}")
+        # If the clip already ended, there's nothing further to skip to -
+        # unlike rewind, forward doesn't restart the clip from the end.
 
     def replay_video(self, index):
         if not self.current_archive_path[index]:
             logging.warning(f"Stream {index}: No video path set for replay")
             return
 
-        self.playback_speeds[index] = 1.0
-
         if self.media_players[index] and not self.video_ended[index]:
             try:
                 self.media_players[index].set_time(0)
-                self.media_players[index].set_rate(1.0)
-                if self.is_paused[index]:
-                    self.media_players[index].play()
-                    self.is_paused[index] = False
-                    new_icon = self.icon_cache["pause"]
-                self.pause_buttons[index].configure(image=new_icon)
-                self.pause_buttons[index].image = new_icon
-                logging.info(f"Stream {index}: Replayed video at 1x speed")
+                self._resume_after_seek(index)
+                logging.info(f"Stream {index}: Replayed video")
             except Exception as e:
                 logging.error(f"Error replaying video for stream {index}: {e}")
         else:
             self.play_archive_video(index, self.current_archive_path[index])
-            logging.info(f"Stream {index}: Restarted video playback at 1x speed")
+            logging.info(f"Stream {index}: Restarted video playback")
 
-    def cycle_speed(self, index):
-        current_speed = self.playback_speeds[index]
-        speed_cycle = [1.0, 2.0, 4.0, 8.0]
-        next_speed = speed_cycle[(speed_cycle.index(current_speed) + 1) % len(speed_cycle)]
-        self.playback_speeds[index] = next_speed
+    def cycle_speed(self):
+        """Cycle the global playback speed and apply it immediately to
+        every currently-playing archive/event clip. Unlike the old
+        per-clip speed button, this is a single control shared across all
+        four quadrants - new clips also pick up whatever speed results
+        here (see play_archive_video)."""
+        current_speed = self.global_playback_speed
+        if current_speed not in self.speed_cycle:
+            # Defensive fallback if a stale/unexpected value ever landed
+            # here (e.g. old config) - snap to the first cycle entry.
+            current_speed = self.speed_cycle[0]
+        next_speed = self.speed_cycle[(self.speed_cycle.index(current_speed) + 1) % len(self.speed_cycle)]
+        self.global_playback_speed = next_speed
 
-        if self.media_players[index]:
-            try:
-                self.media_players[index].set_rate(next_speed)
-                logging.info(f"Stream {index} playback speed set to x{next_speed}")
-            except Exception as e:
-                logging.error(f"Error setting playback speed for stream {index}: {e}")
+        for i in range(4):
+            if self.media_players[i] and self.is_archive_mode[i] and not self.is_paused[i]:
+                try:
+                    self.media_players[i].set_rate(next_speed)
+                except Exception as e:
+                    logging.error(f"Stream {i}: Error applying global playback speed: {e}")
 
-    def monitor_vlc_playback(self, index):
+        # Any event-mode clip currently waiting in its inter-clip gap (or
+        # the initial cross-cam stagger) needs its remaining wait
+        # recalculated against the new speed - otherwise that wait keeps
+        # ticking down at whatever speed was active when it was scheduled,
+        # which is what made higher speeds look broken/stuck for events
+        # with multiple clips or multiple cams.
+        if self.event_mode:
+            self._reschedule_pending_event_afters()
+
+        logging.info(f"Global playback speed set to x{next_speed}")
+
+        if self.speed_toggle_button:
+            icon = self.get_speed_icon(next_speed)
+            self.speed_toggle_button.configure(image=icon)
+            self.speed_toggle_image = icon
+
+    def monitor_vlc_playback(self, index, player):
+        """Monitor one specific archive/event clip playback session.
+
+        player is the exact VLC player object this session started with -
+        captured once, at thread-start, rather than re-read from
+        self.media_players[index] on every iteration. This matters because
+        self.media_players[index] is a shared, mutable slot: if the clip
+        this thread is watching gets torn down and that slot later gets
+        reused for something else entirely (most commonly: exiting event
+        mode restarts a plain LIVE stream into the very same index), a
+        version of this loop that kept re-reading self.media_players[index]
+        would silently latch onto the new live player and keep "monitoring"
+        it forever, since a live stream never reports vlc.State.Ended and
+        self.video_ended[index] is a reusable flag that gets reset to False
+        by the new session's own startup path - so the old thread's loop
+        condition would never become false either. That's what caused a
+        cam exiting event mode to sometimes get stuck: this thread was
+        still alive, silently polling the OLD event-clip player right up
+        until (and past) the point a fresh live player took its place in
+        the same slot.
+
+        The fix: check identity (self.media_players[index] is player) as
+        the primary exit condition - the instant this slot no longer holds
+        the exact object this thread was started for, some other code path
+        has already taken over that index (teardown, a new clip, a fresh
+        live stream) and this thread's job is done."""
         video_path = self.current_archive_path[index]
         while self.running and not self.video_ended[index]:
+            if self.media_players[index] is not player:
+                # Someone else has already replaced/cleared this slot -
+                # this session is over, regardless of what video_ended
+                # says (that flag may have already been reset by whatever
+                # new session took over).
+                logging.info(f"Stream {index}: Monitored player no longer active, stopping this monitor thread")
+                break
             try:
-                if self.media_players[index]:
-                    state = self.media_players[index].get_state()
-                    if state == vlc.State.Ended:
-                        logging.info(f"Stream {index}: python-vlc playback ended")
-                        self.video_ended[index] = True
-                        # In event mode hand off to the event coordinator instead
-                        # of the normal go_back/archive-navigation path.
-                        if self.event_mode:
-                            self.root.after(0, self._on_event_clip_ended, index)
-                            break
-             
-                        existing = self.watch_progress[index].get(video_path, {})
-                        duration = existing.get("duration", 0)
-                        if duration > 0:
-                            self.watch_progress[index][video_path] = {
-                                "position": duration,
-                                "duration": duration,
-                            }
-                            self.watch_progress_dirty = True
+                state = player.get_state()
+                if state == vlc.State.Ended:
+                    logging.info(f"Stream {index}: python-vlc playback ended")
+                    self.video_ended[index] = True
+                    # In event mode hand off to the event coordinator instead
+                    # of the normal go_back/archive-navigation path.
+                    if self.event_mode:
+                        self.root.after(0, self._on_event_clip_ended, index)
                         break
-             
-                    position_ms = self.media_players[index].get_time()
-                    duration_ms = self.media_players[index].get_length()
-                    if position_ms is not None and position_ms > 0 and duration_ms and duration_ms > 0:
+
+                    existing = self.watch_progress[index].get(video_path, {})
+                    duration = existing.get("duration", 0)
+                    if duration > 0:
                         self.watch_progress[index][video_path] = {
-                            "position": position_ms / 1000.0,
-                            "duration": duration_ms / 1000.0,
+                            "position": duration,
+                            "duration": duration,
                         }
                         self.watch_progress_dirty = True
+                    break
+
+                position_ms = player.get_time()
+                duration_ms = player.get_length()
+                if position_ms is not None and position_ms > 0 and duration_ms and duration_ms > 0:
+                    self.watch_progress[index][video_path] = {
+                        "position": position_ms / 1000.0,
+                        "duration": duration_ms / 1000.0,
+                    }
+                    self.watch_progress_dirty = True
                 time.sleep(1.0)
             except Exception as e:
                 logging.error(f"Error monitoring playback for stream {index}: {e}")
@@ -5432,7 +6060,6 @@ class tapoStreamer:
             # Reset archive state
             self.is_archive_mode[index] = False
             self.current_archive_path[index] = None
-            self.playback_speeds[index] = 1.0
             self.is_paused[index] = False
             self.video_ended[index] = False
             self.pagination_state[index] = {}
@@ -5461,6 +6088,11 @@ class tapoStreamer:
             if self.config_panel:
                 self.config_panel.destroy()
                 self.config_panel = None
+                # Children of config_panel (events_button, event_back_button,
+                # speed_toggle_button, etc.) are destroyed along with it -
+                # just drop the now-stale references here.
+                self.speed_toggle_button = None
+                self.speed_toggle_image = None
             if self.ptz_buttons:
                 for button in self.ptz_buttons:
                     button.destroy()
@@ -5522,9 +6154,9 @@ class tapoStreamer:
             self.help_overlay = None
 
         # Cancel any pending event after() callbacks.
-        for _after_id in getattr(self, "_pending_event_afters", []):
+        for _pending in getattr(self, "_pending_event_afters", []):
             try:
-                self.root.after_cancel(_after_id)
+                self.root.after_cancel(_pending["after_id"])
             except Exception:
                 pass
         self._pending_event_afters = []
@@ -5558,8 +6190,8 @@ class tapoStreamer:
                         self.exit_buttons[i].destroy()
                     if self.pause_buttons[i]:
                         self.pause_buttons[i].destroy()
-                    if self.speed_buttons[i]:
-                        self.speed_buttons[i].destroy()
+                    if self.ff_buttons[i]:
+                        self.ff_buttons[i].destroy()
                     if self.replay_buttons[i]:
                         self.replay_buttons[i].destroy()
                     if self.rewind_buttons[i]:
