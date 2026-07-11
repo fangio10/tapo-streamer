@@ -420,6 +420,7 @@ class tapoStreamer:
             "download": self.create_icon("download"),
             "audio_on": self.create_icon("audio_on"),
             "audio_off": self.create_icon("audio_off"),
+            "eye": self.create_icon("eye"),
         }
         # Red variants of the mode-toggle icons, swapped in while Archive /
         # Events mode is active so the button visually indicates current mode.
@@ -444,70 +445,26 @@ class tapoStreamer:
         self.update_streams()
         self.root.after(0, lambda: threading.Thread(target=self.start_streams, daemon=True).start())
 
-    THEME_PALETTES = {
-        "dark": {
-            "bg": "#222222", "bg_alt": "#2a2a2a", "fg": "#ffffff",
-            "fg_dim": "#aaaaaa", "accent": "#e62117",
-            "field_bg": "#333333", "border": "#444444",
-        },
-        "light": {
-            "bg": "#f0f0f0", "bg_alt": "#e2e2e2", "fg": "#1a1a1a",
-            "fg_dim": "#666666", "accent": "#c8261a",
-            "field_bg": "#ffffff", "border": "#bbbbbb",
-        },
+    # Fixed UI colors (previously the "light" theme palette - the only
+    # mode that didn't have the unreadable-dialog-text issue). Dark theme,
+    # light/dark/system switching, and OS theme detection have been
+    # removed entirely; the app always looks like this now.
+    UI_COLORS = {
+        "bg": "#f0f0f0", "bg_alt": "#e2e2e2", "fg": "#1a1a1a",
+        "fg_dim": "#666666", "accent": "#c8261a",
+        "field_bg": "#ffffff", "border": "#bbbbbb",
     }
 
-    def detect_system_theme(self):
-        """Best-effort detection of the OS-wide light/dark preference.
-        Falls back to 'dark' if it can't be determined."""
-        try:
-            if sys.platform.startswith("win"):
-                import winreg
-                key = winreg.OpenKey(
-                    winreg.HKEY_CURRENT_USER,
-                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-                )
-                value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
-                return "light" if value else "dark"
-            elif sys.platform.startswith("linux"):
-                import subprocess
-                try:
-                    result = subprocess.run(
-                        ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
-                        capture_output=True, text=True, timeout=2
-                    )
-                    if result.returncode == 0 and "light" in result.stdout.lower():
-                        return "light"
-                    if result.returncode == 0 and "dark" in result.stdout.lower():
-                        return "dark"
-                except Exception:
-                    pass
-                try:
-                    result = subprocess.run(
-                        ["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"],
-                        capture_output=True, text=True, timeout=2
-                    )
-                    if result.returncode == 0 and "dark" in result.stdout.lower():
-                        return "dark"
-                except Exception:
-                    pass
-        except Exception as e:
-            logging.warning(f"Could not detect system theme, defaulting to dark: {e}")
-        return "dark"
-
     def apply_theme(self):
-        """Apply the active theme (dark/light/system) to ttk and plain Tk
-        widgets, so the app looks the same on Windows 11 as it does on
-        Linux instead of relying on the native/system ttk theme.
+        """Apply the app's fixed UI colors to ttk and plain Tk widgets, so
+        the app looks the same on Windows 11 as it does on Linux instead
+        of relying on the native/system ttk theme.
 
-        Note: this only re-themes UI chrome (dialogs, config panel,
-        archive browser, buttons/text). Camera and clip video panels are
-        intentionally left black regardless of theme, since that's the
-        right backdrop for video either way."""
-        mode = self.ui_theme
-        if mode == "system":
-            mode = self.detect_system_theme()
-        palette = self.THEME_PALETTES.get(mode, self.THEME_PALETTES["dark"])
+        Note: this only themes UI chrome (dialogs, config panel, archive
+        browser, buttons/text). Camera and clip video panels are
+        intentionally left black, since that's the right backdrop for
+        video regardless."""
+        palette = self.UI_COLORS
         self.active_theme_colors = palette
 
         try:
@@ -567,8 +524,8 @@ class tapoStreamer:
                              troughcolor=bg, arrowcolor=fg, bordercolor=border)
 
             # Toplevel dialogs (e.g. the config window) don't pick up the
-            # root's bg automatically - apply the theme default for any
-            # new Toplevel/Frame/Label/Entry/Text created without one.
+            # root's bg automatically - apply the default for any new
+            # Toplevel/Frame/Label/Entry/Text created without one.
             for widget_class in ("Toplevel", "Frame", "Label", "Text"):
                 self.root.option_add(f"*{widget_class}.background", bg)
                 self.root.option_add(f"*{widget_class}.foreground", fg)
@@ -647,8 +604,8 @@ class tapoStreamer:
         self.event_overlap_window_mins = 1
         self.exclusive_archive_audio = True
         self.controls_position = "top-left"
-        self.default_event_filter = "all"
-        self.ui_theme = "dark"
+        self.default_event_filter = []
+        self.enable_event_labels = False
         self.sleep_mode_minutes = 0
 
         # Load from config file if it exists
@@ -695,11 +652,15 @@ class tapoStreamer:
                 self.exclusive_archive_audio = bool(config.get("exclusive_archive_audio", self.exclusive_archive_audio))
                 raw_cp = config.get("controls_position", self.controls_position)
                 self.controls_position = raw_cp if raw_cp in self.CONTROL_POSITIONS else "top-left"
-                self.default_event_filter = str(config.get("default_event_filter", self.default_event_filter) or "all").lower()
-                self.ui_theme = str(config.get("ui_theme", self.ui_theme) or "dark").lower()
-                if self.ui_theme not in ("dark", "light", "system"):
-                    logging.warning(f"Invalid ui_theme: {self.ui_theme}, using default 'dark'")
-                    self.ui_theme = "dark"
+                raw_default_filter = config.get("default_event_filter", self.default_event_filter)
+                if isinstance(raw_default_filter, list):
+                    self.default_event_filter = [str(t).lower() for t in raw_default_filter]
+                elif raw_default_filter and str(raw_default_filter).lower() != "all":
+                    # Legacy single-string format from older config files
+                    self.default_event_filter = [str(raw_default_filter).lower()]
+                else:
+                    self.default_event_filter = []
+                self.enable_event_labels = bool(config.get("enable_event_labels", self.enable_event_labels))
                 try:
                     self.sleep_mode_minutes = int(config.get("sleep_mode_minutes", self.sleep_mode_minutes))
                     if self.sleep_mode_minutes < 0:
@@ -803,7 +764,7 @@ class tapoStreamer:
             "exclusive_archive_audio": self.exclusive_archive_audio,
             "controls_position": self.controls_position,
             "default_event_filter": self.default_event_filter,
-            "ui_theme": self.ui_theme,
+            "enable_event_labels": self.enable_event_labels,
             "sleep_mode_minutes": self.sleep_mode_minutes,
         }
         try:
@@ -956,16 +917,6 @@ class tapoStreamer:
 
         row = add_section_header(core_frame, "Appearance", row)
 
-        THEME_LABELS = {"dark": "Dark", "light": "Light", "system": "Match System"}
-        THEME_VALUES_BY_LABEL = {v: k for k, v in THEME_LABELS.items()}
-        tk.Label(core_frame, text="Theme:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
-        theme_var = tk.StringVar(value=THEME_LABELS.get(self.ui_theme, "Dark"))
-        ttk.Combobox(
-            core_frame, textvariable=theme_var, values=list(THEME_LABELS.values()),
-            state="readonly", width=16
-        ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
-        row += 1
-
         tk.Label(core_frame, text="Font:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
         font_var = tk.StringVar(value=self.ui_font)
         ttk.Combobox(
@@ -1065,20 +1016,65 @@ class tapoStreamer:
         _update_overlap_state()
 
         tk.Label(core_frame, text="Default Event Filter:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
-        default_filter_labels = [self.ALL_TYPES_LABEL] + [
-            self.detection_type_label(cid) for cid in self.DETECTION_TYPE_LABELS
-        ]
-        current_default_label = (
-            self.ALL_TYPES_LABEL if self.default_event_filter == "all"
-            else self.detection_type_label(self.default_event_filter)
+        default_filter_selected = list(self.default_event_filter)  # canonical ids currently selected
+
+        def _default_filter_summary():
+            if not default_filter_selected:
+                return self.ALL_TYPES_LABEL
+            return ", ".join(self.detection_type_label(t) for t in default_filter_selected)
+
+        default_filter_button = tk.Button(
+            core_frame, text=_default_filter_summary(), font=self.app_font(10),
+            anchor="w", relief="flat", bd=1, padx=8,
+            bg=self.active_theme_colors.get("field_bg", "#333333"),
+            fg=self.active_theme_colors.get("fg", "#ffffff"),
+            activebackground=self.active_theme_colors.get("field_bg", "#333333"),
         )
-        if current_default_label not in default_filter_labels:
-            default_filter_labels.append(current_default_label)
-        default_filter_var = tk.StringVar(value=current_default_label)
-        ttk.Combobox(
-            core_frame, textvariable=default_filter_var, values=default_filter_labels,
-            state="readonly", width=16
-        ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        default_filter_button.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+
+        def _open_default_filter_popup():
+            popup = tk.Toplevel(dialog)
+            popup.transient(dialog)
+            popup.resizable(False, False)
+            popup.title("Default Event Filter")
+
+            check_vars = {
+                cid: tk.BooleanVar(value=cid in default_filter_selected)
+                for cid in self.DETECTION_TYPE_LABELS
+            }
+
+            tk.Label(popup, text="Show these types by default:", font=self.app_font(9)).pack(
+                anchor="w", padx=10, pady=(10, 4)
+            )
+            for cid in self.DETECTION_TYPE_LABELS:
+                ttk.Checkbutton(
+                    popup, text=self.detection_type_label(cid), variable=check_vars[cid]
+                ).pack(anchor="w", padx=16, pady=1)
+
+            def _apply():
+                default_filter_selected[:] = [cid for cid, v in check_vars.items() if v.get()]
+                default_filter_button.configure(text=_default_filter_summary())
+                popup.destroy()
+
+            btn_row = tk.Frame(popup)
+            btn_row.pack(pady=(8, 10))
+            tk.Button(btn_row, text="OK", width=8, font=self.app_font(9), command=_apply).pack(
+                side="left", padx=4
+            )
+            tk.Button(btn_row, text="Cancel", width=8, font=self.app_font(9), command=popup.destroy).pack(
+                side="left", padx=4
+            )
+
+            popup.update_idletasks()
+            popup.grab_set()
+
+        default_filter_button.configure(command=_open_default_filter_popup)
+        row += 1
+
+        enable_event_labels_var = tk.BooleanVar(value=self.enable_event_labels)
+        ttk.Checkbutton(
+            core_frame, text="Allow Editing Event Labels", variable=enable_event_labels_var
+        ).grid(row=row, column=0, **SPAN)
         row += 1
 
         def _clear_events_cache():
@@ -1219,8 +1215,8 @@ class tapoStreamer:
                 enable_quality_downgrade_var, drop_threshold_entry, drop_window_entry,
                 downgrade_cooldown_entry, enable_auto_revert_hq_var, stability_period_entry,
                 playback_speed_var, font_var, no_frame_timeout_entry, resume_playback_var,
-                motion_events_var, event_overlap_var, exclusive_audio_var, default_filter_var,
-                theme_var, controls_position_var, sleep_mode_entry
+                motion_events_var, event_overlap_var, exclusive_audio_var, default_filter_selected,
+                controls_position_var, sleep_mode_entry, enable_event_labels_var
             )
         ).pack(side="left", padx=5)
 
@@ -1231,7 +1227,7 @@ class tapoStreamer:
 
         dialog.update_idletasks()
 
-    def save_streams(self, username_entry, password_entry, ip_entries, hq_checkboxes, audio_checkboxes, ptz_checkboxes, fullscreen_buttons_var, debug_var, archive_entry, vlc_params, ptz_resolution_var, save_window_size_var, dialog, enable_retries_var, max_retry_attempts_entry, initial_backoff_delay_entry, enable_quality_downgrade_var, drop_threshold_entry, drop_window_entry, downgrade_cooldown_entry, enable_auto_revert_hq_var, stability_period_entry, playback_speed_var, font_var=None, no_frame_timeout_entry=None, resume_playback_var=None, motion_events_var=None, event_overlap_var=None, exclusive_audio_var=None, default_filter_var=None, theme_var=None, controls_position_var=None, sleep_mode_entry=None):
+    def save_streams(self, username_entry, password_entry, ip_entries, hq_checkboxes, audio_checkboxes, ptz_checkboxes, fullscreen_buttons_var, debug_var, archive_entry, vlc_params, ptz_resolution_var, save_window_size_var, dialog, enable_retries_var, max_retry_attempts_entry, initial_backoff_delay_entry, enable_quality_downgrade_var, drop_threshold_entry, drop_window_entry, downgrade_cooldown_entry, enable_auto_revert_hq_var, stability_period_entry, playback_speed_var, font_var=None, no_frame_timeout_entry=None, resume_playback_var=None, motion_events_var=None, event_overlap_var=None, exclusive_audio_var=None, default_filter_selected=None, controls_position_var=None, sleep_mode_entry=None, enable_event_labels_var=None):
         old_fullscreen_buttons = self.enable_fullscreen_buttons
         # Snapshot which streams were actually live (connected, not just
         # configured) before we touch any config, so saving doesn't force a
@@ -1253,9 +1249,6 @@ class tapoStreamer:
         if font_var is not None:
             chosen = font_var.get()
             self.ui_font = chosen if chosen in self.font_choice_labels else self.font_choice_labels[0]
-        if theme_var is not None:
-            theme_labels = {"Dark": "dark", "Light": "light", "Match System": "system"}
-            self.ui_theme = theme_labels.get(theme_var.get(), "dark")
         if resume_playback_var is not None:
             self.resume_playback = resume_playback_var.get()
         if motion_events_var is not None:
@@ -1277,13 +1270,10 @@ class tapoStreamer:
             except ValueError:
                 logging.warning(f"Invalid sleep_mode_minutes input, using default 0")
                 self.sleep_mode_minutes = 0
-        if default_filter_var is not None:
-            chosen_label = default_filter_var.get()
-            if chosen_label == self.ALL_TYPES_LABEL:
-                self.default_event_filter = "all"
-            else:
-                label_to_id = {self.detection_type_label(cid): cid for cid in self.DETECTION_TYPE_LABELS}
-                self.default_event_filter = label_to_id.get(chosen_label, "all")
+        if default_filter_selected is not None:
+            self.default_event_filter = list(default_filter_selected)
+        if enable_event_labels_var is not None:
+            self.enable_event_labels = enable_event_labels_var.get()
     
         # Save default playback speed
         try:
@@ -1502,7 +1492,10 @@ class tapoStreamer:
 
     def create_icon(self, icon_type, opacity=1.0):
         size = (40, 40) if icon_type in ["config", "back", "left", "right", "up", "down", "fullscreen", "minimize", "play", "resize"] else (100, 100) if icon_type in ["folder", "archive", "back"] else (40, 40)
-        img = Image.new("RGBA", size, (0, 0, 0, 255))
+        if icon_type == "eye":
+          img = Image.new("RGBA", size, (0, 0, 0, 0))
+        else:
+          img = Image.new("RGBA", size, (0, 0, 0, 255))
         draw = ImageDraw.Draw(img)
         
         # Helper function to adjust color opacity
@@ -1605,6 +1598,13 @@ class tapoStreamer:
             draw.polygon([(10, 14), (10, 26), (16, 26), (22, 32), (22, 8), (16, 14)], fill="white")
             draw.line([(25, 14), (33, 26)], fill="white", width=2)
             draw.line([(33, 14), (25, 26)], fill="white", width=2)
+        elif icon_type == "eye":
+            # Open eye: almond outline with a filled pupil - used as the
+            # "event watched" indicator in the event listing. A plain
+            # checkmark didn't read as "watched" without a column header
+            # to label it, but an eye conveys that on its own.
+            draw.ellipse((6, 15, 34, 25), outline="white", width=2)
+            draw.ellipse((16, 16, 24, 24), fill="white")
         elif icon_type == "left":
             draw.polygon([(30, 10), (15, 20), (30, 30)], fill="white")
         elif icon_type == "right":
@@ -1883,7 +1883,7 @@ class tapoStreamer:
                 )
                 try:
                     if self._event_played_label and self._event_played_label.winfo_exists():
-                        self._event_played_label.configure(text="✓")
+                        self._event_played_label.configure(image=self.icon_cache["eye"])
                 except Exception:
                     pass
 
@@ -4568,56 +4568,92 @@ class tapoStreamer:
         tk.Label(filter_bar, text="Filter:", bg="#1a1a1a", fg="#888888",
                  font=self.app_font(9)).pack(side="left", padx=(12, 6), pady=4)
 
-        filter_var = tk.StringVar(value=self.ALL_TYPES_LABEL)
-        filter_combo = ttk.Combobox(
-            filter_bar, textvariable=filter_var, state="readonly", width=18
-        )
-        filter_combo.pack(side="left", pady=4)
+        # filter_selected holds the canonical detection-type ids currently
+        # chosen; empty list means "All Types". Populated from the
+        # configured default once _refresh_filter_options runs below.
+        filter_selected = []
 
         def _label_for_type(canonical_id):
             return self.detection_type_label(canonical_id)
 
+        def _filter_summary():
+            if not filter_selected:
+                return self.ALL_TYPES_LABEL
+            return ", ".join(_label_for_type(t) for t in filter_selected)
+
+        filter_button = tk.Button(
+            filter_bar, text=self.ALL_TYPES_LABEL, font=self.app_font(9),
+            anchor="w", relief="flat", bd=1, padx=8, width=18,
+            bg="#2a2a2a", fg="white", activebackground="#2a2a2a",
+        )
+        filter_button.pack(side="left", pady=4)
+
+        def _open_filter_popup():
+            present_ids = filter_button._present_ids if hasattr(filter_button, "_present_ids") else []
+            popup = tk.Toplevel(self.root)
+            popup.transient(self.root)
+            popup.resizable(False, False)
+            popup.title("Filter Events")
+
+            check_vars = {
+                cid: tk.BooleanVar(value=cid in filter_selected) for cid in present_ids
+            }
+
+            tk.Label(popup, text="Show these types:", font=self.app_font(9)).pack(
+                anchor="w", padx=10, pady=(10, 4)
+            )
+            if not present_ids:
+                tk.Label(popup, text="No detection types for this day.", font=self.app_font(9), fg="#888888").pack(
+                    anchor="w", padx=16, pady=1
+                )
+            for cid in present_ids:
+                ttk.Checkbutton(
+                    popup, text=_label_for_type(cid), variable=check_vars[cid]
+                ).pack(anchor="w", padx=16, pady=1)
+
+            def _apply():
+                filter_selected[:] = [cid for cid, v in check_vars.items() if v.get()]
+                filter_button.configure(text=_filter_summary())
+                popup.destroy()
+                _render_rows(_filtered_events())
+
+            btn_row = tk.Frame(popup)
+            btn_row.pack(pady=(8, 10))
+            tk.Button(btn_row, text="OK", width=8, font=self.app_font(9), command=_apply).pack(side="left", padx=4)
+            tk.Button(btn_row, text="Cancel", width=8, font=self.app_font(9), command=popup.destroy).pack(
+                side="left", padx=4
+            )
+
+            popup.update_idletasks()
+            popup.grab_set()
+
+        filter_button.configure(command=_open_filter_popup)
+
         def _refresh_filter_options(evs, preserve_selection=False):
-            """Rebuild the filter dropdown's options from the detection
-            types actually present in evs. By default applies the
-            configured default (falling back to All Types if not present);
-            when preserve_selection is True, keeps the current choice if
-            it's still a valid option (e.g. after deleting an event)."""
+            """Recompute the detection types actually present in evs (used
+            to populate the filter popup's checklist). By default applies
+            the configured default selection (falling back to All Types if
+            none of it is present); when preserve_selection is True, keeps
+            the current selection, dropping any ids no longer present
+            (e.g. after deleting an event)."""
             present_ids = sorted({t for ev in evs for t in self._event_detection_types(ev)})
-            options = [self.ALL_TYPES_LABEL] + [_label_for_type(cid) for cid in present_ids]
-            filter_combo.configure(values=options)
+            filter_button._present_ids = present_ids
 
-            if preserve_selection and filter_var.get() in options:
-                return present_ids
-
-            if self.default_event_filter != "all" and self.default_event_filter in present_ids:
-                desired = _label_for_type(self.default_event_filter)
+            if preserve_selection:
+                filter_selected[:] = [cid for cid in filter_selected if cid in present_ids]
             else:
-                desired = self.ALL_TYPES_LABEL
-            filter_var.set(desired)
+                filter_selected[:] = [cid for cid in self.default_event_filter if cid in present_ids]
+
+            filter_button.configure(text=_filter_summary())
             return present_ids
 
         def _filtered_events():
-            chosen = filter_var.get()
-            if chosen == self.ALL_TYPES_LABEL:
+            if not filter_selected:
                 return state["events"]
-            label_to_id = {_label_for_type(cid): cid for cid in
-                           {t for ev in state["events"] for t in self._event_detection_types(ev)}}
-            chosen_id = label_to_id.get(chosen)
-            if not chosen_id:
-                return state["events"]
-            return [ev for ev in state["events"] if chosen_id in self._event_detection_types(ev)]
-
-        ttk.Separator(overlay, orient="horizontal").pack(fill="x")
-
-        # ---- Column headers ----
-        cols_frame = tk.Frame(overlay, bg="#2a2a2a")
-        cols_frame.pack(fill="x")
-        COL_WIDTHS = [9, 9, 31, 5, 5, 4, 5, 7]  # action, time, label, 1, 2, 3, 4, watched
-        COL_HEADS  = [" ", "Time", "Label", "1", "2", "3", "4", "Watched"]
-        for w, h in zip(COL_WIDTHS, COL_HEADS):
-            tk.Label(cols_frame, text=h, bg="#2a2a2a", fg="#888888",
-                     font=self.app_font(9, "bold"), width=w).pack(side="left", pady=3)
+            return [
+                ev for ev in state["events"]
+                if any(t in filter_selected for t in self._event_detection_types(ev))
+            ]
 
         ttk.Separator(overlay, orient="horizontal").pack(fill="x")
 
@@ -4724,22 +4760,28 @@ class tapoStreamer:
                 else:
                     types_present = self._event_detection_types(ev)
                     initial_label = ", ".join(self.detection_type_label(t) for t in types_present) if types_present else ""
-                label_var = tk.StringVar(value=initial_label)
-                label_entry = tk.Entry(
-                    row_f, textvariable=label_var, width=16,
-                    bg="#2a2a2a", fg="white", insertbackground="white",
-                    relief="flat", highlightthickness=1,
-                    highlightbackground="#444444", highlightcolor="#666666",
-                    font=self.app_font(10)
-                )
-                label_entry.pack(side="left", padx=(4, 8), ipady=2)
+                if self.enable_event_labels:
+                    label_var = tk.StringVar(value=initial_label)
+                    label_entry = tk.Entry(
+                        row_f, textvariable=label_var, width=16,
+                        bg="#2a2a2a", fg="white", insertbackground="white",
+                        relief="flat", highlightthickness=1,
+                        highlightbackground="#444444", highlightcolor="#666666",
+                        font=self.app_font(10)
+                    )
+                    label_entry.pack(side="left", padx=(4, 8), ipady=2)
 
-                def _save_label(event_ref=ev, v=label_var):
-                    event_ref["label"] = v.get().strip()
-                    self._save_events_json(state["date"], state["events"])
+                    def _save_label(event_ref=ev, v=label_var):
+                        event_ref["label"] = v.get().strip()
+                        self._save_events_json(state["date"], state["events"])
 
-                label_entry.bind("<FocusOut>", lambda e, fn=_save_label: fn())
-                label_entry.bind("<Return>",   lambda e, fn=_save_label: fn())
+                    label_entry.bind("<FocusOut>", lambda e, fn=_save_label: fn())
+                    label_entry.bind("<Return>",   lambda e, fn=_save_label: fn())
+                else:
+                    tk.Label(
+                        row_f, text=initial_label, bg=row_bg, fg="white",
+                        font=self.app_font(10), width=16, anchor="w"
+                    ).pack(side="left", padx=(4, 8))
 
                 # Per-cam checkboxes
                 cam_vars = {}
@@ -4750,8 +4792,13 @@ class tapoStreamer:
                     var = tk.BooleanVar(value=cam_data.get("enabled", False))
                     cam_vars[cam_key] = var
 
-                    cb = ttk.Checkbutton(row_f, variable=var,
-                                         state="normal" if has_clip else "disabled")
+                    cb = tk.Checkbutton(
+                        row_f, variable=var,
+                        state="normal" if has_clip else "disabled",
+                        bg=row_bg, activebackground=row_bg,
+                        highlightthickness=0, bd=0,
+                        selectcolor="#ffffff", disabledforeground=row_bg
+                    )
                     cb.pack(side="left", padx=8)
 
                     def _on_toggle(ck=cam_key, v=var, event_ref=ev):
@@ -4760,11 +4807,13 @@ class tapoStreamer:
 
                     var.trace_add("write", lambda *_, cb=_on_toggle: cb())
 
-                # Played indicator
-                played_txt = "✓" if ev.get("played") else ""
-                played_lbl = tk.Label(row_f, text=played_txt, bg=row_bg,
-                                      fg="#4a9d4a", font=self.app_font(11, "bold"),
-                                      width=3)
+                # Played ("watched") indicator - an eye icon once the event
+                # has been played through, otherwise blank.
+                played_lbl = tk.Label(
+                    row_f,
+                    image=(self.icon_cache["eye"] if ev.get("played") else ""),
+                    bg=row_bg, width=40
+                )
                 played_lbl.pack(side="left", padx=4)
 
                 # Wire play/delete buttons (closures over ev, ev_idx, played_lbl)
@@ -4815,8 +4864,6 @@ class tapoStreamer:
 
         _refresh_filter_options(events)
         _render_rows(_filtered_events())
-
-        filter_combo.bind("<<ComboboxSelected>>", lambda e: _render_rows(_filtered_events()))
 
         # ---- Day navigation wiring ----
         def _navigate(delta):
@@ -5088,10 +5135,10 @@ class tapoStreamer:
                         self._event_date_for_save,
                         self._event_list_for_save
                     )
-                    # Update the ✓ label in the overlay row if it still exists
+                    # Update the "watched" eye icon in the overlay row if it still exists
                     try:
                         if self._event_played_label and self._event_played_label.winfo_exists():
-                            self._event_played_label.configure(text="✓")
+                            self._event_played_label.configure(image=self.icon_cache["eye"])
                     except Exception:
                         pass
 
