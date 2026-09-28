@@ -1513,8 +1513,23 @@ class tapoStreamer:
             return color
 
         if icon_type == "config":
-            draw.rectangle((18, 22, 22, 34), fill="white")
-            draw.rectangle((12, 10, 28, 20), fill="white")
+            import math
+            cx, cy = 20, 20
+            # 8 tapered teeth around the rim
+            for k in range(8):
+                a = math.radians(k * 45)
+                dx, dy = math.cos(a), math.sin(a)
+                px, py = -dy, dx
+                r_in, r_out, hw_in, hw_out = 9, 15, 3.0, 2.0
+                draw.polygon([
+                    (cx + dx * r_in + px * hw_in,   cy + dy * r_in + py * hw_in),
+                    (cx + dx * r_out + px * hw_out, cy + dy * r_out + py * hw_out),
+                    (cx + dx * r_out - px * hw_out, cy + dy * r_out - py * hw_out),
+                    (cx + dx * r_in - px * hw_in,   cy + dy * r_in - py * hw_in),
+                ], fill="white")
+            # gear body, then punch out the center hole
+            draw.ellipse((cx - 11, cy - 11, cx + 11, cy + 11), fill="white")
+            draw.ellipse((cx - 4, cy - 4, cx + 4, cy + 4), fill=(0, 0, 0, 255))
         elif icon_type == "fullscreen":
             draw.rectangle((8, 8, 32, 32), outline="white", width=2)
             draw.line((10, 10, 13, 10), fill="white", width=2)
@@ -3527,7 +3542,11 @@ class tapoStreamer:
                 elif item.endswith(".mp4"):
                     # Files (in folder path) are sorted ascending.
                     # Supports both old (HH-MM) and new (HH-MM-SS) filename formats.
-                    match = re.match(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}(?:-\d{2})?)_(\d+m-\d+s)\.mp4$", item)
+                    match = re.match(
+                        r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}(?:-\d{2})?)_(\d+m-\d+s)"
+                        r"(?:_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*)?\.mp4$",
+                        item
+                    )
                     if not match:
                         logging.warning(f"Stream {index}: Invalid video format for {item}")
                         return datetime.min
@@ -3543,7 +3562,7 @@ class tapoStreamer:
         # Determine sort order based on whether path is the root (folders) or subfolder (files)
         folder_path = os.path.normpath(os.path.join(self.archive_dir, f"cam{index+1}"))
         is_folder_path = os.path.normpath(path) == folder_path
-        sorted_items = sorted(items, key=get_sort_key, reverse=is_folder_path)
+        sorted_items = sorted(items, key=lambda it: (get_sort_key(it), it), reverse=is_folder_path)
 
         # Pagination logic
         total_items = len(sorted_items)
