@@ -433,6 +433,12 @@ class tapoStreamer:
         # image buttons is inconsistent across platforms/themes.
         self.icon_cache["disk_disabled"] = self.dim_icon(self.icon_cache["disk"])
         self.icon_cache["events_disabled"] = self.dim_icon(self.icon_cache["events"])
+        # Half-opacity eye variant: shown for an event exited partway
+        # through (session-only, not persisted to disk) so it's visually
+        # distinct from the full-opacity eye used for a genuine complete
+        # playthrough (which IS persisted). See _return_to_event_listing
+        # vs _on_event_clip_ended.
+        self.icon_cache["eye_partial"] = self.dim_icon(self.icon_cache["eye"], opacity=0.5)
 
         self.day_folder_icon_cache = {}
         self.speed_icon_cache = {}
@@ -1874,18 +1880,20 @@ class tapoStreamer:
                         self.root.after(0, _finish_ui)
             threading.Thread(target=_teardown_players, args=(list(playing),), daemon=True).start()
 
-            # All cams are now done — mark event played and re-show overlay
-            if self.current_playing_event:
-                self.current_playing_event["played"] = True
-                self._save_events_json(
-                    getattr(self, "_event_date_for_save", None),
-                    getattr(self, "_event_list_for_save", [])
-                )
-                try:
-                    if self._event_played_label and self._event_played_label.winfo_exists():
-                        self._event_played_label.configure(image=self.icon_cache["eye"])
-                except Exception:
-                    pass
+            # Event was force-finished (exited early) rather than played to
+            # completion. Show a dimmed, session-only "partially watched"
+            # eye instead of the full-opacity persisted one. Deliberately
+            # does NOT set event["played"] or call _save_events_json - an
+            # early exit should not be indistinguishable from a genuine
+            # full playthrough, and should not survive a rescan/reopen of
+            # the events list (revisiting this day later reloads from
+            # JSON, which never got the partial mark, so it goes back to
+            # blank - matching "disappears when user exits event mode").
+            try:
+                if self._event_played_label and self._event_played_label.winfo_exists():
+                    self._event_played_label.configure(image=self.icon_cache["eye_partial"])
+            except Exception:
+                pass
 
             # If a single-cam event entered fullscreen, drop back to grid
             # before re-showing the overlay so it centres over all panels.
