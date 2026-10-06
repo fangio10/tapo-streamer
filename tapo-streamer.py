@@ -362,6 +362,12 @@ class tapoStreamer:
         self.event_done_cams = set()
         self.event_overlay = None
         self.current_playing_event = None
+        # True if the user skipped (X button) any clip during the current
+        # event playback, so finishing the queue isn't a genuine full watch.
+        self._event_clips_skipped = False
+        # Wall-clock time the first clip of the current event playback
+        # actually started playing (None until then).
+        self._event_first_clip_started_at = None
         # Each entry is a dict: {"kind", "after_id", "index", "path",
         # "unscaled_ms", "scheduled_at", "scheduled_speed"}. "kind" is
         # either "clip_launch" (a delayed next-clip start) or "ramp_step"
@@ -645,6 +651,7 @@ class tapoStreamer:
         self.sleep_hidden_streams = False
         self.events_show_download = False
         self.events_show_delete = False
+        self.event_partial_min_watch_s = 5.0
 
         # Load from config file if it exists
         if os.path.exists(self.config_file):
@@ -701,6 +708,14 @@ class tapoStreamer:
                 self.sleep_hidden_streams = bool(config.get("sleep_hidden_streams", self.sleep_hidden_streams))
                 self.events_show_download = bool(config.get("events_show_download", self.events_show_download))
                 self.events_show_delete = bool(config.get("events_show_delete", self.events_show_delete))
+                try:
+                    self.event_partial_min_watch_s = float(config.get("event_partial_min_watch_s", self.event_partial_min_watch_s))
+                    if self.event_partial_min_watch_s < 0:
+                        logging.warning(f"Invalid event_partial_min_watch_s: {self.event_partial_min_watch_s}, using default 5.0")
+                        self.event_partial_min_watch_s = 5.0
+                except (ValueError, TypeError):
+                    logging.warning("Invalid event_partial_min_watch_s input, using default 5.0")
+                    self.event_partial_min_watch_s = 5.0
                 try:
                     self.sleep_mode_minutes = int(config.get("sleep_mode_minutes", self.sleep_mode_minutes))
                     if self.sleep_mode_minutes < 0:
@@ -810,6 +825,7 @@ class tapoStreamer:
             "sleep_hidden_streams": self.sleep_hidden_streams,
             "events_show_download": self.events_show_download,
             "events_show_delete": self.events_show_delete,
+            "event_partial_min_watch_s": self.event_partial_min_watch_s,
         }
         try:
             os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
@@ -1055,22 +1071,25 @@ class tapoStreamer:
         row += 1
 
         tk.Label(core_frame, text="Sleep Mode (min):", font=self.app_font(10)).grid(row=row, column=0, **LBL)
-        sleep_row = tk.Frame(core_frame)
-        sleep_row.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
-        sleep_mode_entry = tk.Entry(sleep_row, width=10)
+        sleep_mode_entry = tk.Entry(core_frame, width=10)
         sleep_mode_entry.insert(0, str(self.sleep_mode_minutes))
-        sleep_mode_entry.pack(side="left")
+        sleep_mode_entry.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
+
         sleep_hidden_var = tk.BooleanVar(value=self.sleep_hidden_streams)
         ttk.Checkbutton(
-            sleep_row, text="Also when hidden in fullscreen", variable=sleep_hidden_var
-        ).pack(side="left", padx=(10, 0))
+            core_frame, text="Also sleep background cams while one is maximised",
+            variable=sleep_hidden_var
+        ).grid(row=row, column=0, **SPAN)
+        row += 1
+
         tk.Label(
             core_frame,
-            text="Stop live streams when unfocused/minimized this long.\n"
-                 "Ticked: also stop streams hidden behind a fullscreen one. 0 = disabled",
+            text="Stops live streams after this long unfocused or minimized. 0 = disabled\n"
+                 "Ticked: also stops cams in the background while one is maximised.",
             font=self.app_font(9), fg="#888888", justify="left"
-        ).grid(row=row + 1, column=0, columnspan=2, sticky="w", padx=(12, 12), pady=(0, 4))
-        row += 2
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=(12, 12), pady=(0, 4))
+        row += 1
 
         row = add_section_header(core_frame, "Events", row)
 
@@ -1110,6 +1129,22 @@ class tapoStreamer:
         # Read back by save_streams (kept on the dialog to avoid widening its signature)
         dialog.events_show_download_var = show_download_var
         dialog.events_show_delete_var = show_delete_var
+
+        tk.Label(core_frame, text="Partial Watch Minimum:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
+        partial_row = tk.Frame(core_frame)
+        partial_row.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        partial_min_entry = tk.Entry(partial_row, width=10)
+        partial_min_entry.insert(0, f"{self.event_partial_min_watch_s:g}")
+        partial_min_entry.pack(side="left")
+        tk.Label(partial_row, text="sec", font=self.app_font(10)).pack(side="left", padx=(6, 0))
+        tk.Label(
+            core_frame,
+            text="Watch an event at least this long before exiting or skipping a clip\n"
+                 "marks it as partially watched (dimmed eye). 0 = any exit counts",
+            font=self.app_font(9), fg="#888888", justify="left"
+        ).grid(row=row + 1, column=0, columnspan=2, sticky="w", padx=(12, 12), pady=(0, 4))
+        row += 2
+        dialog.event_partial_min_entry = partial_min_entry
 
         tk.Label(core_frame, text="Default Event Filter:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
         default_filter_selected = list(self.default_event_filter)  # canonical ids currently selected
@@ -1368,6 +1403,16 @@ class tapoStreamer:
         _del_var = getattr(dialog, "events_show_delete_var", None)
         if _del_var is not None:
             self.events_show_delete = bool(_del_var.get())
+        _pm_entry = getattr(dialog, "event_partial_min_entry", None)
+        if _pm_entry is not None:
+            try:
+                self.event_partial_min_watch_s = float(_pm_entry.get().strip())
+                if self.event_partial_min_watch_s < 0:
+                    logging.warning(f"Invalid event_partial_min_watch_s: {self.event_partial_min_watch_s}, using default 5.0")
+                    self.event_partial_min_watch_s = 5.0
+            except ValueError:
+                logging.warning("Invalid event_partial_min_watch_s input, using default 5.0")
+                self.event_partial_min_watch_s = 5.0
         if default_filter_selected is not None:
             self.default_event_filter = list(default_filter_selected)
         if sleep_hidden_var is not None:
@@ -2033,20 +2078,9 @@ class tapoStreamer:
                         self.root.after(0, _finish_ui)
             threading.Thread(target=_teardown_players, args=(list(playing),), daemon=True).start()
 
-            # Event was force-finished (exited early) rather than played to
-            # completion. Show a dimmed, session-only "partially watched"
-            # eye instead of the full-opacity persisted one. Deliberately
-            # does NOT set event["played"] or call _save_events_json - an
-            # early exit should not be indistinguishable from a genuine
-            # full playthrough, and should not survive a rescan/reopen of
-            # the events list (revisiting this day later reloads from
-            # JSON, which never got the partial mark, so it goes back to
-            # blank - matching "disappears when user exits event mode").
-            try:
-                if self._event_played_label and self._event_played_label.winfo_exists():
-                    self._event_played_label.configure(image=self.icon_cache["eye_partial"])
-            except Exception:
-                pass
+            # Event was force-finished (exited early): persisted "partially
+            # watched" mark. No-op if the event was already fully watched.
+            self._mark_event_partially_watched(self.current_playing_event)
 
             # If a single-cam event entered fullscreen, drop back to grid
             # before re-showing the overlay so it centres over all panels.
@@ -2216,7 +2250,7 @@ class tapoStreamer:
                 # actually playing (not while just browsing the archive
                 # folder tree), so gate on media_players rather than
                 # is_archive_mode alone.
-                if self.is_archive_mode[self.fullscreen_index] and self.media_players[self.fullscreen_index]:
+                if self.is_archive_mode[self.fullscreen_index]:
                     self.speed_toggle_button.configure(image=self.get_speed_icon(self.global_playback_speed))
                     self.speed_toggle_button.pack(pady=5, padx=10)
                 if ptz_enabled:
@@ -2271,12 +2305,15 @@ class tapoStreamer:
                         image=self.icon_cache["events_active"]
                     )
                     self.events_button.pack(pady=5, padx=10)
-                # Only relevant while a clip is actively playing - the
-                # listing overlay itself is already visible otherwise.
+                # Back-to-listing only makes sense while a clip is actively
+                # playing - the listing overlay itself is already visible otherwise.
                 if self.event_active_cams - self.event_done_cams:
                     self.event_back_button.pack(pady=5, padx=10)
-                    self.speed_toggle_button.configure(image=self.get_speed_icon(self.global_playback_speed))
-                    self.speed_toggle_button.pack(pady=5, padx=10)
+                # Speed control is always available in event mode, so it can
+                # be set from the listing before pressing play, not just
+                # mid-playback.
+                self.speed_toggle_button.configure(image=self.get_speed_icon(self.global_playback_speed))
+                self.speed_toggle_button.pack(pady=5, padx=10)
                 self.config_button.pack(pady=10, padx=10)
             else:
                 any_initializing = any(self.stream_initializing)
@@ -2290,13 +2327,12 @@ class tapoStreamer:
                                else self.icon_cache["disk"])
                     )
                     self.archive_mode_button.pack(pady=5, padx=10)
-                # Global speed control - only relevant while at least one
-                # cam is actually playing a clip in grid mode (not just
-                # browsing the archive folder tree in a quadrant).
-                any_clip_playing = any(
-                    self.is_archive_mode[i] and self.media_players[i] for i in range(4)
-                )
-                if any_clip_playing:
+                # Global speed control - available whenever archive mode is
+                # active (browser or playback), so it can be set before
+                # opening a clip. Deliberately not gated on media_players:
+                # the browser has no player, and a gate on one only passed
+                # by accident while a stale live/clip player was still alive.
+                if any_archive_mode:
                     self.speed_toggle_button.configure(image=self.get_speed_icon(self.global_playback_speed))
                     self.speed_toggle_button.pack(pady=5, padx=10)
                 # Pack events button in grid mode if motion_triggered_events is on
@@ -4328,6 +4364,7 @@ class tapoStreamer:
         # than navigating the archive folder tree or tearing down the whole
         # session.
         if self.event_mode:
+            self._event_clips_skipped = True
             self._on_event_clip_ended(index)
             return
 
@@ -4613,6 +4650,8 @@ class tapoStreamer:
                     continue
                 if old.get("played"):
                     ev["played"] = True
+                elif old.get("partial"):
+                    ev["partial"] = True
                 for cam_key, cam_data in ev["cams"].items():
                     old_cam = old.get("cams", {}).get(cam_key)
                     # Only honour the old checkbox if that cam already had
@@ -5229,9 +5268,14 @@ class tapoStreamer:
 
                 # Watched indicator: always create the item (blank if unplayed)
                 # so the playback code can switch its image later.
+                if ev.get("played"):
+                    eye_img = self.icon_cache["eye"]
+                elif ev.get("partial"):
+                    eye_img = self.icon_cache["eye_partial"]
+                else:
+                    eye_img = ""
                 eye_item = canvas.create_image(
-                    eye_cx, cy, image=(self.icon_cache["eye"] if ev.get("played") else ""),
-                    tags=("evrow",)
+                    eye_cx, cy, image=eye_img, tags=("evrow",)
                 )
                 played_icon = _PlayedIcon(eye_item)
 
@@ -5639,13 +5683,22 @@ class tapoStreamer:
         # Kick off coordinated playback for event across all enabled cams.
 
         self.current_playing_event = event
+        self._event_clips_skipped = False
+        self._event_first_clip_started_at = None
         self.event_clip_queues  = [[] for _ in range(4)]
         self.event_active_cams  = set()
         self.event_done_cams    = set()
 
         # Parse the event's global start time for delay calculations.
+        event_start_dt = None
         try:
-            event_start_dt = datetime.strptime(event["start"], "%Y-%m-%dT%H:%M:%S")
+            enabled_starts = [
+                datetime.strptime(cd["clips"][0]["clip_start"], "%Y-%m-%dT%H:%M:%S")
+                for cd in event["cams"].values()
+                if cd.get("enabled") and cd.get("clips")
+            ]
+            if enabled_starts:
+                event_start_dt = min(enabled_starts)
         except Exception:
             event_start_dt = None
 
@@ -5804,6 +5857,28 @@ class tapoStreamer:
         else:
             self._teardown_clip_async(index, lambda i=index: self._finish_event_cam(i))
 
+    def _mark_event_partially_watched(self, event):
+        """Mark an event as partially watched: persisted as ev["partial"] and
+        shown as the dimmed eye. Never applied to an event that has already
+        been fully watched (the 'played' flag wins)."""
+        if not event or event.get("played"):
+            return
+        # Ignore brief peeks: require a minimum amount of actual playback
+        # (configurable; measured from when the first clip really started,
+        # so an exit during the initial stagger wait never counts).
+        started = self._event_first_clip_started_at
+        if started is None or time.time() - started < self.event_partial_min_watch_s:
+            return
+        newly_marked = not event.get("partial")
+        event["partial"] = True
+        if newly_marked:
+            self._save_events_json(self._event_date_for_save, self._event_list_for_save)
+        try:
+            if self._event_played_label and self._event_played_label.winfo_exists():
+                self._event_played_label.configure(image=self.icon_cache["eye_partial"])
+        except Exception:
+            pass
+
     def _finish_event_cam(self, index):
         """This cam's clips are all done (its player is already released)."""
         if not self.event_mode:
@@ -5820,17 +5895,22 @@ class tapoStreamer:
         if self.event_done_cams >= self.event_active_cams:
             # All cams finished - mark played and restore overlay
             if self.current_playing_event:
-                self.current_playing_event["played"] = True
-                self._save_events_json(
-                    self._event_date_for_save,
-                    self._event_list_for_save
-                )
-                # Update the "watched" eye icon in the overlay row if it still exists
-                try:
-                    if self._event_played_label and self._event_played_label.winfo_exists():
-                        self._event_played_label.configure(image=self.icon_cache["eye"])
-                except Exception:
-                    pass
+                if not self._event_clips_skipped:
+                    # Genuine full playthrough: persist, clear any partial mark.
+                    self.current_playing_event["played"] = True
+                    self.current_playing_event.pop("partial", None)
+                    self._save_events_json(
+                        self._event_date_for_save,
+                        self._event_list_for_save
+                    )
+                    try:
+                        if self._event_played_label and self._event_played_label.winfo_exists():
+                            self._event_played_label.configure(image=self.icon_cache["eye"])
+                    except Exception:
+                        pass
+                else:
+                    # A clip was skipped: partial mark (no-op if already fully watched).
+                    self._mark_event_partially_watched(self.current_playing_event)
 
             if self.event_overlay and self.event_overlay.winfo_exists():
                 # If a single-cam event entered fullscreen, drop back to
@@ -6249,6 +6329,9 @@ class tapoStreamer:
         if (token != self._play_tokens[index] or not self.running
                 or self.media_players[index] is not player):
             return   # cancelled or replaced while starting
+
+        if self.event_mode and self._event_first_clip_started_at is None:
+            self._event_first_clip_started_at = time.time()
 
         self.set_audio_state(index, mute=self.archive_audio_muted[index])
 
