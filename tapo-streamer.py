@@ -122,6 +122,11 @@ class tapoStreamer:
 
     ALL_TYPES_LABEL = "All Types"
 
+    # A cached day is only trusted if its scan ran at least this long after
+    # the newest day-folder mtime. Covers coarse mtime resolution (FAT 2s,
+    # some SMB setups) and small client/server clock skew on network shares.
+    EVENTS_CACHE_TRUST_MARGIN_NS = 5_000_000_000
+
     @classmethod
     def normalize_detection_type(cls, raw):
         """Map a raw filename token to a canonical detection-type id, or
@@ -638,6 +643,8 @@ class tapoStreamer:
         self.default_event_filter = []
         self.sleep_mode_minutes = 0
         self.sleep_hidden_streams = False
+        self.events_show_download = False
+        self.events_show_delete = False
 
         # Load from config file if it exists
         if os.path.exists(self.config_file):
@@ -692,6 +699,8 @@ class tapoStreamer:
                 else:
                     self.default_event_filter = []
                 self.sleep_hidden_streams = bool(config.get("sleep_hidden_streams", self.sleep_hidden_streams))
+                self.events_show_download = bool(config.get("events_show_download", self.events_show_download))
+                self.events_show_delete = bool(config.get("events_show_delete", self.events_show_delete))
                 try:
                     self.sleep_mode_minutes = int(config.get("sleep_mode_minutes", self.sleep_mode_minutes))
                     if self.sleep_mode_minutes < 0:
@@ -799,6 +808,8 @@ class tapoStreamer:
             "default_event_filter": self.default_event_filter,
             "sleep_mode_minutes": self.sleep_mode_minutes,
             "sleep_hidden_streams": self.sleep_hidden_streams,
+            "events_show_download": self.events_show_download,
+            "events_show_delete": self.events_show_delete,
         }
         try:
             os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
@@ -1085,6 +1096,21 @@ class tapoStreamer:
         motion_events_var.trace_add("write", _update_overlap_state)
         _update_overlap_state()
 
+        show_download_var = tk.BooleanVar(value=self.events_show_download)
+        ttk.Checkbutton(
+            core_frame, text="Show Download Button in Event List", variable=show_download_var
+        ).grid(row=row, column=0, **SPAN)
+        row += 1
+
+        show_delete_var = tk.BooleanVar(value=self.events_show_delete)
+        ttk.Checkbutton(
+            core_frame, text="Show Delete Button in Event List", variable=show_delete_var
+        ).grid(row=row, column=0, **SPAN)
+        row += 1
+        # Read back by save_streams (kept on the dialog to avoid widening its signature)
+        dialog.events_show_download_var = show_download_var
+        dialog.events_show_delete_var = show_delete_var
+
         tk.Label(core_frame, text="Default Event Filter:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
         default_filter_selected = list(self.default_event_filter)  # canonical ids currently selected
 
@@ -1336,6 +1362,12 @@ class tapoStreamer:
             except ValueError:
                 logging.warning(f"Invalid sleep_mode_minutes input, using default 0")
                 self.sleep_mode_minutes = 0
+        _dl_var = getattr(dialog, "events_show_download_var", None)
+        if _dl_var is not None:
+            self.events_show_download = bool(_dl_var.get())
+        _del_var = getattr(dialog, "events_show_delete_var", None)
+        if _del_var is not None:
+            self.events_show_delete = bool(_del_var.get())
         if default_filter_selected is not None:
             self.default_event_filter = list(default_filter_selected)
         if sleep_hidden_var is not None:
@@ -4406,13 +4438,14 @@ class tapoStreamer:
 
         return os.path.join(self._events_dir(), str(date.year), date.strftime("%Y%m%d") + ".json")
 
-    def _scan_events_for_date(self, date):
+    def _scan_events_for_date(self, date, exclude_paths=None):
         # Scan archive clips for date and cluster them into events.
         from datetime import timedelta
 
         date_str = date.strftime("%Y-%m-%d")
         min_duration_s = 10          # Ignore clips shorter than this
         gap_limit = timedelta(minutes=self.event_overlap_window_mins)
+        exclude_paths = exclude_paths or set()
 
         # --- Collect all parseable clips across all cams ---
         # Trailing _<detectiontype> is optional, for backwards compatibility
@@ -4435,6 +4468,9 @@ class tapoStreamer:
                 m = clip_re.match(fname)
                 if not m:
                     continue
+                clip_path = os.path.join(day_folder, fname)
+                if clip_path in exclude_paths:
+                    continue
                 d_str, t_str, mins_str, secs_str, raw_type = m.groups()
                 try:
                     start_dt = datetime.strptime(f"{d_str} {t_str.replace('-', ':')}", "%Y-%m-%d %H:%M:%S" if t_str.count('-') == 2 else "%Y-%m-%d %H:%M")
@@ -4445,7 +4481,7 @@ class tapoStreamer:
                     continue
                 end_dt = start_dt + timedelta(seconds=duration_s)
                 detection_type = self.normalize_detection_type(raw_type)
-                all_clips.append((start_dt, end_dt, cam_idx, os.path.join(day_folder, fname), detection_type))
+                all_clips.append((start_dt, end_dt, cam_idx, clip_path, detection_type))
 
         if not all_clips:
             return []
@@ -4512,66 +4548,105 @@ class tapoStreamer:
 
         return events
 
+    def _events_fingerprint(self, date):
+        """Cheap change detector: per-cam day-folder mtimes plus the
+        clustering setting. A folder's mtime changes when a clip is added,
+        removed or renamed."""
+        date_str = date.strftime("%Y-%m-%d")
+        mtimes = {}
+        for cam_idx in range(4):
+            if not self.ips[cam_idx]:
+                continue
+            folder = os.path.join(self.archive_dir, f"cam{cam_idx + 1}", date_str)
+            try:
+                mtimes[str(cam_idx + 1)] = os.stat(folder).st_mtime_ns
+            except OSError:
+                mtimes[str(cam_idx + 1)] = None
+        return {"mtimes": mtimes, "overlap": self.event_overlap_window_mins}
+
+    def _read_events_payload(self, date):
+        try:
+            with open(self._events_path(date)) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _events_cache_trusted(self, payload, fingerprint):
+        """Fingerprint equality alone isn't enough on coarse-mtime
+        filesystems (e.g. Samba): a clip added in the same timestamp tick as
+        the scan leaves the mtime unchanged. So only trust the cache if the
+        scan ran comfortably AFTER the newest folder mtime. Otherwise rescan,
+        which records a later scan time, and the day becomes trusted once it
+        has been quiet long enough."""
+        scanned_ns = payload.get("scanned_at_ns")
+        if not isinstance(scanned_ns, int):
+            return False
+        newest = max(
+            (v for v in fingerprint["mtimes"].values() if isinstance(v, int)),
+            default=0
+        )
+        return scanned_ns - newest > self.EVENTS_CACHE_TRUST_MARGIN_NS
+
     def _load_or_scan_events(self, date):
-        # Return the events list for date, using cached JSON for past days.
-        from datetime import date as _date
-        json_path = self._events_path(date)
-        today = _date.today()
-        is_today = (date.year == today.year and date.month == today.month and date.day == today.day)
+        # Taken BEFORE the fingerprint and scan, so anything arriving
+        # mid-scan can only make the cache look newer-than-scan (rescan),
+        # never older (stale).
+        scan_ns = time.time_ns()
+        fingerprint = self._events_fingerprint(date)
+        payload = self._read_events_payload(date)
 
-        if not is_today and os.path.exists(json_path):
-            try:
-                with open(json_path) as f:
-                    data = json.load(f)
-                return data.get("events", [])
-            except Exception as e:
-                logging.warning(f"Events: failed to read cache {json_path}: {e}")
+        if (payload
+                and payload.get("fingerprint") == fingerprint
+                and self._events_cache_trusted(payload, fingerprint)):
+            return payload.get("events", [])
 
-        # Scan from archive
-        events = self._scan_events_for_date(date)
+        deleted = set((payload or {}).get("deleted_clips", []))
+        events = self._scan_events_for_date(date, exclude_paths=deleted)
 
-        # Carry user state (label, played flag, camera checkboxes) over from
-        # any existing cache file, matched by event id. Without this, every
-        # rescan of today overwrote the file with fresh defaults.
-        if os.path.exists(json_path):
-            try:
-                with open(json_path) as f:
-                    cached = {
-                        e.get("id"): e
-                        for e in json.load(f).get("events", [])
-                        if isinstance(e, dict)
-                    }
-                for ev in events:
-                    old = cached.get(ev["id"])
-                    if not old:
-                        continue
-                    if old.get("played"):
-                        ev["played"] = True
-                    for cam_key, cam_data in ev["cams"].items():
-                        old_cam = old.get("cams", {}).get(cam_key)
-                        # Only honour the old checkbox if that cam already had
-                        # clips then; a cam that newly gained clips keeps the
-                        # scanner's default (enabled).
-                        if old_cam and old_cam.get("clips") and cam_data.get("clips"):
-                            cam_data["enabled"] = bool(old_cam.get("enabled", cam_data["enabled"]))
-            except Exception as e:
-                logging.warning(f"Events: could not merge cached state from {json_path}: {e}")
+        # Carry user state (played flag, camera checkboxes) over by event id.
+        if payload:
+            cached = {e.get("id"): e for e in payload.get("events", []) if isinstance(e, dict)}
+            for ev in events:
+                old = cached.get(ev["id"])
+                if not old:
+                    continue
+                if old.get("played"):
+                    ev["played"] = True
+                for cam_key, cam_data in ev["cams"].items():
+                    old_cam = old.get("cams", {}).get(cam_key)
+                    # Only honour the old checkbox if that cam already had
+                    # clips then; a cam that newly gained clips keeps the
+                    # scanner's default (enabled).
+                    if old_cam and old_cam.get("clips") and cam_data.get("clips"):
+                        cam_data["enabled"] = bool(old_cam.get("enabled", cam_data["enabled"]))
 
-        self._save_events_json(date, events)
+        self._save_events_json(date, events, fingerprint=fingerprint, scan_ns=scan_ns)
         return events
 
-    def _save_events_json(self, date, events):
-        """Persist events list for date to its JSON file."""
+    def _save_events_json(self, date, events, fingerprint=None, scan_ns=None, deleted_add=None):
+        """Persist events. fingerprint, scan time and deleted_clips are carried
+        over from the existing file unless supplied, so checkbox/played saves
+        don't clobber them."""
         json_path = self._events_path(date)
         try:
-            os.makedirs(os.path.dirname(json_path), exist_ok=True)
+            existing = self._read_events_payload(date) or {}
+            deleted = set(existing.get("deleted_clips", []))
+            if deleted_add:
+                deleted.update(deleted_add)
             payload = {
-                "date":       date.strftime("%Y-%m-%d"),
-                "scanned_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-                "events":     events,
+                "date":          date.strftime("%Y-%m-%d"),
+                "scanned_at":    datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                "scanned_at_ns": scan_ns if scan_ns is not None else existing.get("scanned_at_ns"),
+                "fingerprint":   fingerprint if fingerprint is not None else existing.get("fingerprint"),
+                "deleted_clips": sorted(deleted),
+                "events":        events,
             }
-            with open(json_path, "w") as f:
+            os.makedirs(os.path.dirname(json_path), exist_ok=True)
+            tmp = json_path + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(payload, f, indent=2)
+            os.replace(tmp, json_path)
         except Exception as e:
             logging.warning(f"Events: failed to write cache {json_path}: {e}")
 
@@ -5048,7 +5123,263 @@ class tapoStreamer:
         # State held across day navigation refreshes
         state = {"date": date, "events": events}
 
+        # ---- Event rows are drawn directly on the canvas (no per-row widgets) ----
+        # Building ~13 Tk widgets per row was slow (the display server is waited
+        # on per widget under XWayland, and the cost grew over a session) and
+        # leaked a trace variable per checkbox. Rows are now plain canvas items,
+        # and clicks go through ONE canvas-level binding that looks up the item
+        # under the pointer, so nothing but the items themselves is created per
+        # render.
+        ROW_H = 48
+        ICON = 40
+        CB_CELL = 48
+        CB_HALF = 9      # half-size of a camera checkbox square
+        state["actions"] = {}
+        state["drawn_w"] = 0
+
+        class _PlayedIcon:
+            """Stand-in for the old 'watched' eye Label: the playback code only
+            calls winfo_exists() and configure(image=...) on it."""
+            def __init__(self, item):
+                self.item = item
+
+            def winfo_exists(self):
+                try:
+                    return bool(canvas.winfo_exists()) and canvas.type(self.item) is not None
+                except tk.TclError:
+                    return False
+
+            def configure(self, **kw):
+                if "image" in kw:
+                    canvas.itemconfigure(self.item, image=kw["image"])
+
+        def _paint_checkbox(box, tick, on, bg):
+            canvas.itemconfigure(box, fill="#ffffff" if on else "#f0f0f0", outline="#000000")
+            canvas.itemconfigure(tick, state="normal" if on else "hidden")
+
         def _render_rows(evs):
+            canvas.itemconfigure(canvas_win, state="hidden")   # legacy widget host, unused
+            canvas.delete("evrow")
+            actions = {}
+            state["actions"] = actions
+
+            W = canvas.winfo_width()
+            if W <= 1:
+                # Not mapped yet (initial open): fall back to the overlay size.
+                # The <Configure> handler below redraws at the real width.
+                W = max(300, getattr(self, "_event_overlay_size", (820, 500))[0] - 22)
+            state["drawn_w"] = W
+
+            font_spec = self.app_font(10)
+            font_obj = tkfont.Font(root=self.root, font=font_spec)
+
+            if not evs:
+                canvas.create_text(
+                    W // 2, 40, text="No events found for this day.", fill="#666666",
+                    font=self.app_font(10, "italic"), tags=("evrow",)
+                )
+                canvas.configure(scrollregion=(0, 0, W, 80))
+                return
+
+            def _fit_text(text, max_px):
+                if max_px <= 0:
+                    return ""
+                if font_obj.measure(text) <= max_px:
+                    return text
+                ell = "\u2026"
+                lo, hi = 0, len(text)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if font_obj.measure(text[:mid] + ell) <= max_px:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                return text[:lo] + ell if lo > 0 else ""
+
+            show_dl = bool(getattr(self, "events_show_download", False))
+            show_del = bool(getattr(self, "events_show_delete", False))
+
+            # Left: play [download] [delete]; then time and detection types.
+            x = 6
+            play_x = x
+            x += ICON + 2
+            dl_x = None
+            if show_dl:
+                dl_x = x
+                x += ICON + 2
+            del_x = None
+            if show_del:
+                del_x = x
+                x += ICON + 2
+            time_x = x + 8
+            type_x = time_x + font_obj.measure("00:00\u201300:00") + 24
+
+            # Right: four camera checkboxes, then the watched eye.
+            eye_cx = W - 8 - ICON // 2
+            cb_right = W - 8 - ICON - 6
+            cb_cx = {ci: cb_right - CB_CELL * (4 - ci) - CB_CELL // 2 for ci in range(1, 5)}
+            type_max = (cb_right - CB_CELL * 4) - type_x - 8
+
+            for ev_idx, ev in enumerate(evs):
+                y0 = ev_idx * ROW_H
+                cy = y0 + ROW_H // 2
+                row_bg = "#1e1e1e" if ev_idx % 2 == 0 else "#232323"
+                canvas.create_rectangle(0, y0, W, y0 + ROW_H, fill=row_bg, outline="", tags=("evrow",))
+                canvas.create_line(0, y0 + ROW_H - 1, W, y0 + ROW_H - 1, fill="#2f2f2f", tags=("evrow",))
+
+                # Watched indicator: always create the item (blank if unplayed)
+                # so the playback code can switch its image later.
+                eye_item = canvas.create_image(
+                    eye_cx, cy, image=(self.icon_cache["eye"] if ev.get("played") else ""),
+                    tags=("evrow",)
+                )
+                played_icon = _PlayedIcon(eye_item)
+
+                def _play(event_ref=ev, p_icon=played_icon):
+                    enabled_cams = [
+                        int(ck) - 1
+                        for ck, cd in event_ref["cams"].items()
+                        if cd.get("enabled") and cd.get("clips")
+                    ]
+                    if not enabled_cams:
+                        messagebox.showwarning(
+                            "No Cameras Selected",
+                            "Enable at least one camera checkbox before playing.",
+                            parent=self.root
+                        )
+                        return
+                    overlay.place_forget()
+                    self._start_event_playback(event_ref, p_icon, state["date"], state["events"])
+
+                def _download(event_ref=ev):
+                    self._download_event_clips(event_ref)
+
+                def _delete(ev_ref=ev):
+                    if messagebox.askyesno(
+                        "Delete Event",
+                        "Remove this event?",
+                        parent=self.root
+                    ):
+                        paths = [c["path"] for cd in ev_ref["cams"].values()
+                                 for c in cd.get("clips", []) if c.get("path")]
+                        state["events"][:] = [e for e in state["events"] if e is not ev_ref]
+                        self._save_events_json(state["date"], state["events"], deleted_add=paths)
+                        _refresh_filter_options(state["events"], preserve_selection=True)
+                        _render_rows(_filtered_events())
+
+                canvas.create_image(
+                    play_x, cy, image=self.icon_cache["play"], anchor="w",
+                    tags=("evrow", f"play:{ev_idx}")
+                )
+                actions[f"play:{ev_idx}"] = _play
+                if show_dl:
+                    canvas.create_image(
+                        dl_x, cy, image=self.icon_cache["download"], anchor="w",
+                        tags=("evrow", f"dl:{ev_idx}")
+                    )
+                    actions[f"dl:{ev_idx}"] = _download
+                if show_del:
+                    canvas.create_image(
+                        del_x, cy, image=self.icon_cache["delete"], anchor="w",
+                        tags=("evrow", f"del:{ev_idx}")
+                    )
+                    actions[f"del:{ev_idx}"] = _delete
+
+                # Time range
+                try:
+                    s = datetime.strptime(ev["start"], "%Y-%m-%dT%H:%M:%S")
+                    e = datetime.strptime(ev["end"], "%Y-%m-%dT%H:%M:%S")
+                    time_txt = f"{s.strftime('%H:%M')}\u2013{e.strftime('%H:%M')}"
+                except Exception:
+                    time_txt = ev.get("start", "?")[:16]
+                canvas.create_text(
+                    time_x, cy, text=time_txt, fill="white", font=font_spec,
+                    anchor="w", tags=("evrow",)
+                )
+
+                # Detection types present in the event (e.g. "Person, Vehicle")
+                types_present = self._event_detection_types(ev)
+                label_txt = ", ".join(self.detection_type_label(t) for t in types_present) if types_present else ""
+                canvas.create_text(
+                    type_x, cy, text=_fit_text(label_txt, type_max), fill="white",
+                    font=font_spec, anchor="w", tags=("evrow",)
+                )
+
+                # Per-camera checkboxes (rendered for all 4 camera slots)
+                for ci in range(1, 5):
+                    cam_key = str(ci)
+                    
+                    if cam_key not in ev["cams"]:
+                        ev["cams"][cam_key] = {"enabled": False, "clips": []}
+                    cam_data = ev["cams"][cam_key]
+                    
+                    on = bool(cam_data.get("enabled", False))
+                    cx = cb_cx[ci]
+                    tag = f"cb:{ev_idx}:{ci}"
+                    
+                    # --- The Fix ---
+                    # A box is clickable if it has clips OR if it is actively enabled right now.
+                    has_clips = bool(cam_data.get("clips"))
+                    is_clickable = has_clips or on
+
+                    # If it's clickable, it always gets a white background (even if currently unchecked)
+                    initial_bg = "#ffffff" if is_clickable else row_bg
+                    # ----------------
+
+                    box = canvas.create_rectangle(
+                        cx - CB_HALF, cy - CB_HALF, cx + CB_HALF, cy + CB_HALF,
+                        outline="#888888", fill=initial_bg,
+                        tags=("evrow", tag)
+                    )
+                    
+                    tick = canvas.create_line(
+                        cx - 5, cy, cx - 1, cy + 4, cx + 5, cy - 4,
+                        fill="#111111", width=2, state=("normal" if on else "hidden"),
+                        tags=("evrow", tag)
+                    )
+
+                    # Note: We pass "#ffffff" here so that if a clickable box is unticked, 
+                    # the _paint_checkbox helper keeps it white instead of reverting to row_bg.
+                    def _toggle(ck=cam_key, event_ref=ev, b=box, t=tick, bg="#ffffff", allowed=is_clickable):
+                        if not allowed:
+                            return
+                            
+                        cd = event_ref["cams"][ck]
+                        cd["enabled"] = not cd.get("enabled", False)
+                        _paint_checkbox(b, t, cd["enabled"], bg)
+                        self._save_events_json(state["date"], state["events"])
+
+                    actions[tag] = _toggle
+
+            canvas.configure(scrollregion=(0, 0, W, len(evs) * ROW_H))
+
+        def _current_action():
+            for tag in canvas.gettags("current"):
+                fn = state["actions"].get(tag)
+                if fn is not None:
+                    return fn
+            return None
+
+        def _on_canvas_click(event):
+            fn = _current_action()
+            if fn is not None:
+                fn()
+
+        def _on_canvas_motion(event):
+            canvas.configure(cursor="hand2" if _current_action() is not None else "")
+
+        def _on_canvas_resize(event):
+            if event.width > 1 and event.width != state["drawn_w"]:
+                _render_rows(_filtered_events())
+
+        canvas.bind("<Button-1>", _on_canvas_click, add="+")
+        canvas.bind("<Motion>", _on_canvas_motion, add="+")
+        canvas.bind("<Leave>", lambda e: canvas.configure(cursor=""), add="+")
+        canvas.bind("<Configure>", _on_canvas_resize, add="+")
+
+        # Legacy widget-per-row renderer: no longer called (superseded by the
+        # canvas renderer above). Kept for reference; safe to delete.
+        def _render_rows_widgets(evs):
             _unbind_scroll(rows_frame)
             for w in rows_frame.winfo_children():
                 w.destroy()
@@ -5155,8 +5486,10 @@ class tapoStreamer:
                         "Remove this event?",
                         parent=self.root
                     ):
+                        paths = [c["path"] for cd in ev_ref["cams"].values()
+                                 for c in cd.get("clips", []) if c.get("path")]
                         state["events"][:] = [e for e in state["events"] if e is not ev_ref]
-                        self._save_events_json(state["date"], state["events"])
+                        self._save_events_json(state["date"], state["events"], deleted_add=paths)
                         _refresh_filter_options(state["events"], preserve_selection=True)
                         _render_rows(_filtered_events())
 
