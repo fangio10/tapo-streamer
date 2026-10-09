@@ -122,6 +122,13 @@ class tapoStreamer:
 
     ALL_TYPES_LABEL = "All Types"
 
+    # False (default): the Archive/Events buttons are locked only while a mode
+    # transition is in flight (teardown + restart). Plain stream (re)inits do not
+    # lock them, because every entry point now aborts and waits for in-flight
+    # inits before touching a player. Set True to ALSO lock them whenever any
+    # stream is initializing (the old behaviour).
+    LOCK_MODE_BUTTONS_DURING_INIT = False
+
     # A cached day is only trusted if its scan ran at least this long after
     # the newest day-folder mtime. Covers coarse mtime resolution (FAT 2s,
     # some SMB setups) and small client/server clock skew on network shares.
@@ -197,11 +204,15 @@ class tapoStreamer:
         log_dir = os.path.dirname(self.config_file)
         log_file = os.path.join(log_dir, "tapo-streamer.log")
 
-        logging.basicConfig(
-            filename=log_file,
-            level=log_level,
-            format='%(asctime)s - %(levelname)s - %(message)s'
-        )
+        # Rotate (5 MB x 3) so a long-running session can't grow the log
+        # forever, and include the thread name so a transition can be traced
+        # across the Tk thread and its worker threads.
+        from logging.handlers import RotatingFileHandler
+        _handler = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024,
+                                       backupCount=3, encoding="utf-8")
+        _handler.setFormatter(logging.Formatter(
+            '%(asctime)s [%(threadName)s] %(levelname)s - %(message)s'))
+        logging.basicConfig(level=log_level, handlers=[_handler])
 
         zeep_logger = logging.getLogger('zeep')
         zeep_logger.propagate = False 
@@ -269,6 +280,12 @@ class tapoStreamer:
         self.fullscreen_index = None
         self.help_overlay = None
         self.vlc_instances = [None] * 4
+        # Serialises the START of each live stream (instance -> player -> play()).
+        # crash.log showed 3-4 threads inside libvlc_new / media_player_new /
+        # audio_set_mute at the same moment when every stream segfaulted.
+        self._vlc_start_lock = threading.Lock()
+        # Serialises runtime audio calls (mute) into libvlc's audio output.
+        self._vlc_audio_lock = threading.Lock()
         self.stream_initializing = [False] * 4
         self.stream_init_lock = threading.Lock()
         self.stream_cleanup_events = [threading.Event() for _ in range(4)]
@@ -299,6 +316,13 @@ class tapoStreamer:
         # another thread. See update_layout() and _cleanup_archive_mode_vlc().
         self.pending_vlc_teardown = set()
         self.archive_transitioning = [False] * 4
+        # Mode transitions (event overlay open teardown, event exit restart)
+        # currently in flight. Tk thread only. While > 0 the Archive/Events
+        # buttons are locked AND every mode handler refuses to start another
+        # transition, so a queued click can't slip past a stale button state.
+        self._mode_busy = 0
+        self._mode_busy_since = 0.0
+        self._exit_event_pending = False
         self.media_players = [None] * 4
         self.streams = [""] * 4
         self.panels = [None] * 4
@@ -1623,7 +1647,8 @@ class tapoStreamer:
         want_audio = (self.is_fullscreen and self.fullscreen_index == index
                       and not self.is_archive_mode[index])
         try:
-            player.audio_set_mute(not want_audio)
+            with self._vlc_audio_lock:
+                player.audio_set_mute(not want_audio)
         except Exception as e:
             logging.error(f"Stream {index}: Failed to apply live audio state: {e}")
 
@@ -1632,6 +1657,7 @@ class tapoStreamer:
         config save: stop it instead of leaving the old player running."""
         self._request_init_abort(index)
         with self.archive_entry_locks[index]:
+            self._wait_init_idle(index)
             self.cleanup_stream(index)
             self.update_stream_label(index, "Disabled")
         if self.fullscreen_buttons[index]:
@@ -2069,13 +2095,15 @@ class tapoStreamer:
             def _teardown_players(idxs):
                 for i in idxs:
                     with self.archive_entry_locks[i]:
-                        self.cleanup_stream(i)
-                        self.pending_vlc_teardown.discard(i)
+                        try:
+                            self.cleanup_stream(i)
+                        finally:
+                            self._clear_pending_teardown(i)
                         def _finish_ui(idx=i):
                             for widget in self.labels[idx].winfo_children():
                                 widget.destroy()
                             self._reset_clip_buttons(idx)
-                        self.root.after(0, _finish_ui)
+                        self._tk_wait(_finish_ui)
             threading.Thread(target=_teardown_players, args=(list(playing),), daemon=True).start()
 
             # Event was force-finished (exited early): persisted "partially
@@ -2242,8 +2270,13 @@ class tapoStreamer:
             # Pack buttons based on state
             if self.is_fullscreen and self.fullscreen_index is not None and not self.event_mode:
                 if (self.archive_dir and self.streams[self.fullscreen_index]):
-                    self.archive_buttons[self.fullscreen_index].configure(
-                        image=self.icon_cache["disk_active"] if self.is_archive_mode[self.fullscreen_index] else self.icon_cache["disk"]
+                    _fi = self.fullscreen_index
+                    _locked = self._index_locked(_fi)
+                    self.archive_buttons[_fi].configure(
+                        image=(self.icon_cache["disk_active"] if self.is_archive_mode[_fi]
+                               else self.icon_cache["disk_disabled"] if _locked
+                               else self.icon_cache["disk"]),
+                        state="disabled" if _locked else "normal"
                     )
                     self.archive_buttons[self.fullscreen_index].pack(pady=5, padx=10)
                 # Global speed control - only relevant while a clip is
@@ -2266,7 +2299,7 @@ class tapoStreamer:
                 # and live - so the user can jump straight to Events without
                 # backing out to grid first. Same button/behaviour as grid mode.
                 if self.motion_triggered_events and self.archive_dir:
-                    any_initializing = any(self.stream_initializing)
+                    any_initializing = self._modes_busy()
                     self.events_button.configure(
                         state="disabled" if any_initializing else "normal",
                         image=(self.icon_cache["events_active"] if self.event_mode
@@ -2281,7 +2314,7 @@ class tapoStreamer:
                 # Archive toggle, Events toggle, back-to-listing, and Config.
                 # No PTZ or exit-fullscreen/grid button, regardless of
                 # fullscreen state.
-                any_initializing = any(self.stream_initializing)
+                any_initializing = self._modes_busy()
                 # NOTE: is_archive_mode[i] is also set True for any cam
                 # currently playing an event clip (play_archive_video()
                 # reuses the archive-mode VLC pipeline for clip playback),
@@ -2316,7 +2349,7 @@ class tapoStreamer:
                 self.speed_toggle_button.pack(pady=5, padx=10)
                 self.config_button.pack(pady=10, padx=10)
             else:
-                any_initializing = any(self.stream_initializing)
+                any_initializing = self._modes_busy()
                 any_archive_mode = any(self.is_archive_mode[i] for i in range(4))
                 # Pack archive mode button only in grid mode if archive_dir is valid.
                 if self.archive_dir:
@@ -2596,6 +2629,7 @@ class tapoStreamer:
 
         def _teardown():
             with self.archive_entry_locks[index]:
+                self._wait_init_idle(index)
                 self.cleanup_stream(index)
                 # Label only once the player has really stopped painting.
                 self.update_stream_label(index, "Sleeping")
@@ -2695,6 +2729,7 @@ class tapoStreamer:
             for i in idxs:
                 try:
                     with self.archive_entry_locks[i]:
+                        self._wait_init_idle(i)
                         self.cleanup_stream(i)
                         # Label only after the player has really stopped
                         # painting, or the text never becomes visible. Set
@@ -2758,7 +2793,8 @@ class tapoStreamer:
                 state = self.media_players[index].get_state()
                 if state in (vlc.State.Error, vlc.State.Ended, vlc.State.Stopped):
                     return
-                self.media_players[index].audio_set_mute(mute)
+                with self._vlc_audio_lock:
+                    self.media_players[index].audio_set_mute(mute)
             except Exception as e:
                 logging.error(f"Stream {index}: Failed to set python-vlc audio state: {e}")
 
@@ -2787,6 +2823,7 @@ class tapoStreamer:
                 logging.warning(f"Stream {index}: Already initializing, skipping retry")
                 return False
             self.stream_initializing[index] = True
+        self._post_refresh_buttons()
 
         try:
             if not self.ips[index] or not self.streams[index]:
@@ -2818,7 +2855,8 @@ class tapoStreamer:
                 else:
                     self.update_stream_label(index, "Loading...")
 
-                logging.info(f"Stream {index}: Attempt {attempt+1}/{max_attempts}")
+                if max_attempts > 1:
+                    logging.info(f"Stream {index}: Attempt {attempt+1}/{max_attempts}")
 
                 if not self.check_network_connectivity(self.ips[index]):
                     logging.warning(f"Stream {index}: Network check failed")
@@ -2867,6 +2905,7 @@ class tapoStreamer:
                 self.stream_initializing[index] = False
                 # The in-flight init this abort was aimed at is over.
                 self.stream_abort_events[index].clear()
+            self._post_refresh_buttons()
 
     def build_vlc_instance_args(self, extra_args=None, allow_frame_drop=False):
         """Build the common libvlc instance argument list, with optional
@@ -2945,7 +2984,8 @@ class tapoStreamer:
         """Initialize a stream using Python-VLC (libvlc auto-selects hardware decode if available)."""
         logging.info(f"Stream {index}: Initializing stream")
         try:
-            xid = self.labels[index].winfo_id()
+            # Resolved ON the Tk thread (creating the X window is an Xlib call).
+            xid = self._tk_call(lambda: self.labels[index].winfo_id())
         except Exception as e:
             logging.error(f"Stream {index}: Failed to get window ID: {e}")
             return False
@@ -2955,8 +2995,13 @@ class tapoStreamer:
         check_interval = 0.5
         required_frames = 5
         frame_times = []
+        start_lock_held = False
 
         try:
+            # Start streams one at a time (only this short phase; the frame wait
+            # below still runs in parallel).
+            self._vlc_start_lock.acquire()
+            start_lock_held = True
             instance = vlc.Instance(self.build_vlc_instance_args())
             if not instance:
                 raise RuntimeError("Failed to create VLC instance")
@@ -2967,16 +3012,23 @@ class tapoStreamer:
                 raise RuntimeError("Failed to create VLC media player")
             self.media_players[index] = player
             media = instance.media_new(self.streams[index])
+            if not self.audio_enabled[index]:
+                # Cam has audio switched off: never create an audio output at all,
+                # so there is nothing to mute and no audio code path to race.
+                media.add_option(":no-audio")
             player.set_media(media)
             player.set_xwindow(xid) if sys.platform.startswith("linux") else player.set_hwnd(xid)
 
             if player.play() == -1:
                 raise RuntimeError("Failed to start VLC player")
 
-            try:
-                player.audio_set_mute(True)
-            except Exception:
-                pass
+            # The early audio_set_mute(True) that used to be here is gone: it ran
+            # while the player's audio output was still being created on its
+            # decoder thread, and segfaulted in VLC's PipeWire plugin
+            # (pw_thread_loop_lock, NULL loop) in every logged crash. The mute is
+            # now applied once the stream is up, by _apply_live_audio().
+            self._vlc_start_lock.release()
+            start_lock_held = False
 
             while time.time() - start_wait < timeout:
                 if self.stream_abort_events[index].is_set() or not self.running:
@@ -3008,11 +3060,11 @@ class tapoStreamer:
                         recent_frames = sum(f for _, f in frame_times)
                         if recent_frames >= required_frames:
                             for _ in range(5):
-                                time.sleep(0.5)
                                 width, height = player.video_get_size(0) or (0, 0)
                                 if width > 0 and height > 0:
                                     self.frame_shapes[index] = (width, height)
                                     break
+                                time.sleep(0.5)
                             player.video_set_scale(0)
                             self.last_dropped_frames[index] = stats.lost_pictures
                             mt = threading.Thread(target=self.monitor_stream, args=(index, player), daemon=True)
@@ -3025,12 +3077,19 @@ class tapoStreamer:
             logging.warning(f"Stream {index}: No frames detected within {timeout}s")
             return False
         except Exception as e:
+            if start_lock_held:
+                self._vlc_start_lock.release()
             logging.error(f"Stream {index}: Python-VLC initialization failed: {e}")
             return False
 
     def cleanup_stream(self, index):
         """Clean up stream resources."""
-        logging.info(f"Stream {index}: Cleaning up")
+        # Most calls are a no-op (try_init always cleans first): only log the
+        # ones that actually release something, with how long it took.
+        _had_resources = bool(self.media_players[index] or self.vlc_instances[index])
+        _cleanup_t0 = time.time()
+        if _had_resources:
+            logging.info(f"Stream {index}: Cleaning up")
         self.stream_cleanup_events[index].set()
         self._stop_hover_poll(index)
 
@@ -3070,7 +3129,8 @@ class tapoStreamer:
             self.last_dropped_frames[index] = 0
             self.last_displayed_frames[index] = 0
 
-            logging.info(f"Stream {index}: Cleanup completed")
+            if _had_resources:
+                logging.info(f"Stream {index}: Cleanup completed in {int((time.time() - _cleanup_t0) * 1000)}ms")
         except Exception as e:
             logging.error(f"Stream {index}: Cleanup failed: {e}")
         finally:
@@ -3126,7 +3186,7 @@ class tapoStreamer:
         while self.running and self.media_players[index] is player:
             # Wait for cleanup event or poll timeout
             if self.stream_cleanup_events[index].wait(timeout=1.0):
-                logging.info(f"Stream {index}: Cleanup event set, stopping monitoring")
+                # (the "monitoring stopped" line below covers this exit)
                 break
 
             try:
@@ -3238,99 +3298,162 @@ class tapoStreamer:
 
         logging.info(f"Stream {index} monitoring stopped")
 
+    # --- Mode-transition guard ----------------------------------------------
+    #
+    # One source of truth for "is it safe to start a mode change right now",
+    # used both to draw the buttons AND checked at the top of every handler
+    # (buttons, keys, right-click, the events overlay X), so a click that was
+    # already queued when the button state changed is rejected when processed.
+
+    def _modes_busy(self):
+        if self._mode_busy > 0 and time.time() - self._mode_busy_since > 60:
+            logging.warning("Mode-transition busy flag held for >60s, forcing it clear")
+            self._mode_busy = 0
+        if self._mode_busy > 0 or any(self.archive_transitioning) or self.pending_vlc_teardown:
+            return True
+        return bool(self.LOCK_MODE_BUTTONS_DURING_INIT and any(self.stream_initializing))
+
+    def _index_locked(self, index):
+        return bool(
+            self._mode_busy > 0
+            or self.archive_transitioning[index]
+            or index in self.pending_vlc_teardown
+            or (self.LOCK_MODE_BUTTONS_DURING_INIT and self.stream_initializing[index])
+        )
+
+    def _begin_mode_switch(self):
+        """Tk thread only. Pair with _end_mode_switch (posted from the worker)."""
+        self._mode_busy += 1
+        self._mode_busy_since = time.time()
+        self._refresh_mode_buttons()
+
+    def _end_mode_switch(self):
+        self._mode_busy = max(0, self._mode_busy - 1)
+        self._reenable_stream_action_buttons()
+
+    def _post_to_tk(self, fn):
+        try:
+            self.root.after(0, fn)
+        except Exception:
+            pass   # root already destroyed (shutdown)
+
+    def _post_refresh_buttons(self):
+        self._post_to_tk(self._refresh_mode_buttons)
+
+    def _refresh_mode_buttons(self, indices=None):
+        """Recompute Archive/Events/per-panel archive button state from the
+        guard. Tk thread only."""
+        try:
+            busy = self._modes_busy()
+            any_archive_mode = (not self.event_mode) and any(self.is_archive_mode[i] for i in range(4))
+            if self.archive_mode_button:
+                if busy:
+                    self.archive_mode_button.configure(
+                        state="disabled",
+                        image=self.icon_cache["disk_active"] if any_archive_mode else self.icon_cache["disk_disabled"]
+                    )
+                elif self.archive_dir:
+                    self.archive_mode_button.configure(
+                        state="normal",
+                        image=self.icon_cache["disk_active"] if any_archive_mode else self.icon_cache["disk"]
+                    )
+            if self.events_button:
+                if busy:
+                    self.events_button.configure(
+                        state="disabled",
+                        image=self.icon_cache["events_active"] if self.event_mode else self.icon_cache["events_disabled"]
+                    )
+                elif self.motion_triggered_events and self.archive_dir:
+                    self.events_button.configure(
+                        state="normal",
+                        image=self.icon_cache["events_active"] if self.event_mode else self.icon_cache["events"]
+                    )
+            for i in (range(4) if indices is None else indices):
+                btn = self.archive_buttons[i]
+                if btn:
+                    locked = self._index_locked(i)
+                    btn.configure(
+                        state="disabled" if locked else "normal",
+                        image=(self.icon_cache["disk_active"] if self.is_archive_mode[i]
+                               else self.icon_cache["disk_disabled"] if locked
+                               else self.icon_cache["disk"])
+                    )
+        except Exception as e:
+            logging.warning(f"Failed to refresh mode buttons: {e}")
+
     def _disable_stream_action_buttons(self, indices=None):
-        # Disable the archive-mode and events buttons on the main thread,
-        # while live streams reinitialize (guards against clicking either
-        # button and racing the new player, which can segfault). Shown
-        # dimmed/inactive unless that mode is actually still active - it
-        # never should be on this path, since this is only reached after
-        # exiting to live, but the check is kept for correctness.
-        #
-        # archive_mode_button and events_button both act on every stream at
-        # once (toggle_all_archive_mode / toggle_event_mode loop all 4
-        # indices), so they must stay disabled for the full duration
-        # regardless of which indices are reinitializing.
-        #
-        # NOTE: is_archive_mode[i] is also set True for any cam currently
-        # playing an event clip (play_archive_video() reuses the
-        # archive-mode VLC pipeline for clip playback), not just for
-        # user-toggled Archive mode. While event mode is active, treat the
-        # archive button as inactive rather than reading is_archive_mode
-        # directly, since real user-facing Archive mode can't be active at
-        # the same time as event mode (see toggle_event_mode /
-        # toggle_all_archive_mode).
-        any_archive_mode = (not self.event_mode) and any(self.is_archive_mode[i] for i in range(4))
-        if self.archive_mode_button:
-            self.archive_mode_button.configure(
-                state="disabled",
-                image=self.icon_cache["disk_active"] if any_archive_mode else self.icon_cache["disk_disabled"]
-            )
-        if self.events_button:
-            self.events_button.configure(
-                state="disabled",
-                image=self.icon_cache["events_active"] if self.event_mode else self.icon_cache["events_disabled"]
-            )
-        # The fullscreen-specific archive button (self.archive_buttons[i]) is
-        # a separate widget from archive_mode_button above, and is only
-        # otherwise refreshed by build_config_panel() - which doesn't run
-        # synchronously on the archive-exit path. Without this, it would
-        # keep showing its last image (red) for the whole lock duration.
-        #
-        # Unlike the two buttons above, toggle_archive_mode(idx) only ever
-        # touches its own index, so only the indices actually reinitializing
-        # need disabling here - a slow camera on index 2 has no bearing on
-        # whether it's safe to click the fullscreen archive button for
-        # index 0. Defaults to all 4 for callers that don't know/care which
-        # indices are affected (e.g. a blanket disable before scanning).
-        target_indices = range(4) if indices is None else indices
-        for i in target_indices:
-            btn = self.archive_buttons[i]
-            if btn:
-                btn.configure(
-                    state="disabled",
-                    image=self.icon_cache["disk_active"] if self.is_archive_mode[i] else self.icon_cache["disk_disabled"]
-                )
+        # Kept for existing callers: state now comes from the guard, so this
+        # just re-evaluates it.
+        self._refresh_mode_buttons(indices)
 
     def _reenable_stream_action_buttons(self, indices=None):
         # A stream that just (re)started while hidden needs its countdown.
         self._schedule_bg_sleep_reconcile()
-        # archive_mode_button and events_button act on every stream at once,
-        # so they're only safe to reenable once nothing anywhere is still
-        # initializing - a caller finishing its own subset of streams
-        # doesn't mean some other in-flight init (from a different call
-        # site) isn't still racing against a fresh player elsewhere.
-        any_initializing = any(self.stream_initializing)
-        # NOTE: is_archive_mode[i] is also set True for any cam currently
-        # playing an event clip (play_archive_video() reuses the
-        # archive-mode VLC pipeline for clip playback), not just for
-        # user-toggled Archive mode. Treat the archive button as inactive
-        # while event mode is active, since real user-facing Archive mode
-        # can't be active at the same time (see toggle_event_mode /
-        # toggle_all_archive_mode).
-        any_archive_mode = (not self.event_mode) and any(self.is_archive_mode[i] for i in range(4))
-        if not any_initializing:
-            if self.archive_mode_button and self.archive_dir:
-                self.archive_mode_button.configure(
-                    state="normal",
-                    image=self.icon_cache["disk_active"] if any_archive_mode else self.icon_cache["disk"]
-                )
-            if self.events_button and self.motion_triggered_events and self.archive_dir:
-                self.events_button.configure(
-                    state="normal",
-                    image=self.icon_cache["events_active"] if self.event_mode else self.icon_cache["events"]
-                )
-        target_indices = range(4) if indices is None else indices
-        for i in target_indices:
-            # Same reasoning for the per-panel button: only safe to reenable
-            # index i's button once index i itself is no longer initializing.
-            if self.stream_initializing[i]:
-                continue
-            btn = self.archive_buttons[i]
-            if btn:
-                btn.configure(
-                    state="normal",
-                    image=self.icon_cache["disk_active"] if self.is_archive_mode[i] else self.icon_cache["disk"]
-                )
+        self._refresh_mode_buttons(indices)
+
+    def _defer_exit_event_mode(self):
+        """User asked to leave Events while a transition is still in flight:
+        run the exit as soon as the guard clears instead of dropping the click."""
+        if self._exit_event_pending:
+            return
+        self._exit_event_pending = True
+        logging.info("Events: exit requested mid-transition, deferring until idle")
+
+        def _poll():
+            if not self.running:
+                self._exit_event_pending = False
+                return
+            if self._modes_busy():
+                self.root.after(100, _poll)
+                return
+            self._exit_event_pending = False
+            if self.event_mode:
+                self._exit_event_mode()
+        self.root.after(100, _poll)
+
+    # --- Cross-thread helpers ---------------------------------------------
+
+    def _tk_call(self, fn, timeout=30.0):
+        """Run fn on the Tk thread and wait for its result. For WORKER threads;
+        on the Tk thread itself it just runs inline (no deadlock)."""
+        if threading.current_thread() is threading.main_thread():
+            return fn()
+        done = threading.Event()
+        box = {}
+
+        def _w():
+            try:
+                box["value"] = fn()
+            except Exception as e:
+                box["error"] = e
+            finally:
+                done.set()
+        self.root.after(0, _w)
+        if not done.wait(timeout):
+            raise TimeoutError("Tk thread did not run the callback in time")
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+    def _tk_wait(self, fn):
+        """_tk_call that only logs on failure (for cleanup steps)."""
+        try:
+            self._tk_call(fn)
+        except Exception as e:
+            logging.warning(f"Tk-side step did not complete: {e}")
+
+    def _wait_init_idle(self, index, timeout=10.0):
+        """Block (worker thread) until no init is in flight for this stream, so
+        its player is never released while init_stream is still using it."""
+        deadline = time.time() + timeout
+        while self.stream_initializing[index] and time.time() < deadline:
+            time.sleep(0.05)
+        if self.stream_initializing[index]:
+            logging.warning(f"Stream {index}: init still running after {timeout}s, proceeding anyway")
+
+    def _clear_pending_teardown(self, index):
+        self.pending_vlc_teardown.discard(index)
+        self._post_refresh_buttons()
 
     def start_streams(self):
 
@@ -3523,6 +3646,10 @@ class tapoStreamer:
         if not self.archive_dir:
             return
 
+        if self._modes_busy():
+            logging.info("Archive: ignored, a mode transition is still in progress")
+            return
+
         if self.event_mode:
             # Switching from Events -> Archive: close the event overlay and
             # coordinated playback first, then fall through to enter archive.
@@ -3563,7 +3690,9 @@ class tapoStreamer:
         # unconditional stop-all-cams behaviour on entry) so no live feed
         # keeps rendering/decoding behind the archive browser view.
         for i in range(4):
-            if i not in eligible and not self.is_archive_mode[i] and self.media_players[i]:
+            if (i not in eligible and not self.is_archive_mode[i]
+                    and (self.media_players[i] or self.stream_initializing[i])):
+                self._request_init_abort(i)
                 threading.Thread(target=self._locked_cleanup_stream, args=(i,), daemon=True).start()
 
         for i in eligible:
@@ -3577,6 +3706,9 @@ class tapoStreamer:
             return
 
         if self.archive_transitioning[index]:
+            return
+        if self._mode_busy > 0:
+            logging.info(f"Stream {index}: archive toggle ignored, a mode transition is in progress")
             return
         self.archive_transitioning[index] = True
 
@@ -3595,6 +3727,10 @@ class tapoStreamer:
             # actually released. Cleared once _cleanup_archive_mode_vlc
             # completes, in _exit_archive_locked below.
             self.pending_vlc_teardown.add(index)
+
+        # archive_transitioning is set: lock the mode buttons right now, not
+        # after a worker thread gets scheduled.
+        self._refresh_mode_buttons()
 
         if self.is_archive_mode[index]:
             self.labels[index].pack_forget()
@@ -3641,34 +3777,26 @@ class tapoStreamer:
             def _exit_archive_locked():
                 with self.archive_entry_locks[index]:
                     self._cleanup_archive_mode_vlc(index)
-                    self.pending_vlc_teardown.discard(index)
-                    self.root.after(0, lambda: self._cleanup_archive_mode_ui(index))
+                    self._clear_pending_teardown(index)
+                    # Wait for the Tk-side repack/destroy before the live
+                    # stream is attached to this label again.
+                    self._tk_wait(lambda: self._cleanup_archive_mode_ui(index))
 
                     if restart_stream:
-                        # Disable both action buttons while this stream
-                        # re-initializes so the user can't click archive/events
-                        # and race against the new player. The two global
-                        # buttons (archive_mode_button/events_button) still
-                        # cover all 4 indices since they act on every stream,
-                        # but the per-panel archive button only needs to
-                        # cover this one index.
-                        self.root.after(0, lambda: self._disable_stream_action_buttons(indices=[index]))
-
                         self.try_init_stream_with_retries(index)
-
-                        def _on_done():
-                            self._reenable_stream_action_buttons(indices=[index])
-                            if rebuild_ui:
-                                self.build_config_panel()
-                        self.root.after(0, _on_done)
                     else:
                         logging.info(f"Stream {index}: Archive mode exited without restarting live stream (mode switch)")
-                        if rebuild_ui:
-                            self.root.after(0, self.build_config_panel)
 
-                # Teardown (and restart, if any) for this index is now
-                # fully resolved - accept the next toggle.
+                # Teardown (and restart, if any) for this index is now fully
+                # resolved - accept the next toggle, and only THEN refresh the
+                # buttons so they see the cleared flag.
                 self.archive_transitioning[index] = False
+
+                def _on_done():
+                    self._reenable_stream_action_buttons(indices=[index])
+                    if rebuild_ui:
+                        self.build_config_panel()
+                self._post_to_tk(_on_done)
 
             threading.Thread(target=_exit_archive_locked, daemon=True).start()
 
@@ -3691,7 +3819,7 @@ class tapoStreamer:
         # Archive mode switch) - clear the flag now that it's genuinely
         # released, so update_layout()'s rebind guard doesn't stay blocked
         # for this index indefinitely.
-        self.pending_vlc_teardown.discard(index)
+        self._clear_pending_teardown(index)
 
         root_path = os.path.normpath(os.path.join(self.archive_dir, f"cam{index+1}"))
         try:
@@ -3720,6 +3848,7 @@ class tapoStreamer:
                 # The entry transition is fully resolved now (canvas shows
                 # either the browser or an error state) - accept new toggles.
                 self.archive_transitioning[index] = False
+                self._refresh_mode_buttons()
 
         self.root.after(0, finish)
 
@@ -4715,7 +4844,11 @@ class tapoStreamer:
           - Otherwise, open Events mode.
         """
         if self.event_mode:
-            self._exit_event_mode()
+            self._exit_event_mode()   # defers itself if a transition is in flight
+            return
+
+        if self._modes_busy():
+            logging.info("Events: ignored, a mode transition is still in progress")
             return
 
         if any(self.is_archive_mode[i] for i in range(4)):
@@ -4737,6 +4870,12 @@ class tapoStreamer:
 
     def _exit_event_mode(self, restart_streams=True):
         # Tear down event mode and return all quadrants to live streams.
+        if restart_streams and self._modes_busy():
+            # The listing's own teardown (or an archive exit) is still running.
+            # Starting the restart now could overlap it on the same stream, so
+            # run this exit as soon as everything is idle.
+            self._defer_exit_event_mode()
+            return
         self.event_mode = False
 
         for _pending in self._pending_event_afters:
@@ -4841,8 +4980,9 @@ class tapoStreamer:
         # All live streams were stopped on entry — restart every configured cam.
         cams_to_restart = [i for i in range(4) if self.ips[i] and self.streams[i]]
         if cams_to_restart:
-            # Disable both action buttons immediately.
-            self.root.after(0, self._disable_stream_action_buttons)
+            # Hold the mode buttons (and every mode handler) for the whole
+            # teardown + restart sequence.
+            self._begin_mode_switch()
 
             archive_teardown_set = set(archive_cams_to_teardown)
 
@@ -4875,8 +5015,10 @@ class tapoStreamer:
                     with self.archive_entry_locks[idx]:
                         if idx in archive_teardown_set:
                             self._cleanup_archive_mode_vlc(idx)
-                            self.pending_vlc_teardown.discard(idx)
-                            self.root.after(0, lambda i=idx: self._cleanup_archive_mode_ui(i))
+                            self._clear_pending_teardown(idx)
+                            # Wait for the Tk-side repack/destroy to finish before
+                            # the live stream is attached to this label again.
+                            self._tk_wait(lambda i=idx: self._cleanup_archive_mode_ui(i))
                         self.try_init_stream_with_retries(idx)
 
                 threads = [
@@ -4893,7 +5035,7 @@ class tapoStreamer:
                     t.join()
                 # All inits done — re-enable buttons and refresh the panel.
                 def _on_done():
-                    self._reenable_stream_action_buttons()
+                    self._end_mode_switch()
                     self.build_config_panel()
                 self.root.after(0, _on_done)
 
@@ -4943,14 +5085,26 @@ class tapoStreamer:
         teardown_indices = list(range(4))
         was_archive_mode = {i: self.is_archive_mode[i] for i in teardown_indices}
 
+        # Any init still in flight (monitor downgrade, click-to-reconnect,
+        # wake, startup) must stop BEFORE its player is released below.
+        for i in teardown_indices:
+            self._request_init_abort(i)
+
         def _teardown_all(idxs):
-            for i in idxs:
-                with self.archive_entry_locks[i]:
-                    if self.media_players[i]:
-                        self.cleanup_stream(i)
-                    if was_archive_mode[i]:
-                        self.root.after(0, lambda idx=i: self._cleanup_archive_mode_ui(idx))
-                    self.root.after(0, lambda idx=i: self._set_event_blank_label(idx))
+            try:
+                for i in idxs:
+                    with self.archive_entry_locks[i]:
+                        self._wait_init_idle(i)
+                        if self.media_players[i]:
+                            self.cleanup_stream(i)
+                        # Wait for each Tk-side step so the sequence is really
+                        # finished (and the busy flag honest) when we release it.
+                        if was_archive_mode[i]:
+                            self._tk_wait(lambda idx=i: self._cleanup_archive_mode_ui(idx))
+                        self._tk_wait(lambda idx=i: self._set_event_blank_label(idx))
+            finally:
+                self._post_to_tk(self._end_mode_switch)
+        self._begin_mode_switch()
         threading.Thread(target=_teardown_all, args=(teardown_indices,), daemon=True).start()
 
         # Clear label click bindings now that event_mode is True — prevents
@@ -5802,6 +5956,7 @@ class tapoStreamer:
     def _locked_cleanup_stream(self, index):
         """cleanup_stream under the per-index lock, for use on a worker thread."""
         with self.archive_entry_locks[index]:
+            self._wait_init_idle(index)
             self.cleanup_stream(index)
 
     def _teardown_clip_async(self, index, then=None):
@@ -6200,7 +6355,7 @@ class tapoStreamer:
             # Buttons start hidden; the hover-poll loop will place/forget them
             # as the cursor enters/leaves the quadrant.
             self.labels[index].update_idletasks()
-            logging.info(f"Stream {index}: Buttons created for video {video_path}")
+            logging.debug(f"Stream {index}: Buttons created for video {video_path}")
         except Exception as e:
             logging.error(f"Stream {index}: Failed to create or place buttons: {e}")
             self.labels[index].configure(image="", text="Button Creation Failed", fg="white")
@@ -6580,7 +6735,7 @@ class tapoStreamer:
                 # this session is over, regardless of what video_ended
                 # says (that flag may have already been reset by whatever
                 # new session took over).
-                logging.info(f"Stream {index}: Monitored player no longer active, stopping this monitor thread")
+                logging.debug(f"Stream {index}: Monitored player no longer active, stopping this monitor thread")
                 break
             try:
                 state = player.get_state()
@@ -7046,6 +7201,7 @@ class tapoStreamer:
         def _vlc_teardown():
             for i in range(4):
                 try:
+                    self._wait_init_idle(i, timeout=4.0)
                     self.cleanup_stream(i)
                 except Exception as e:
                     logging.error(f"Error during shutdown of stream {i}: {e}")
@@ -7092,6 +7248,26 @@ class tapoStreamer:
         _threading.Thread(target=_vlc_teardown, daemon=True).start()
 
 if __name__ == "__main__":
+    # Xlib must be told it will be used from several threads BEFORE Tk opens
+    # the display (Tk, libvlc's GL vout and our worker threads all hit X).
+    if sys.platform.startswith("linux"):
+        try:
+            ctypes.CDLL("libX11.so.6").XInitThreads()
+        except OSError:
+            pass
+    # A native crash (SIGSEGV/SIGABRT in libvlc/Xlib) leaves no Python
+    # traceback; faulthandler dumps every thread's Python stack to this file.
+    try:
+        import faulthandler
+        if sys.platform.startswith("linux"):
+            _crash_dir = os.path.join(os.path.expanduser("~"), ".tapo-streamer")
+        else:
+            _crash_dir = os.path.join(os.getenv("APPDATA", os.path.expanduser("~")), "TapoStreamer")
+        os.makedirs(_crash_dir, exist_ok=True)
+        _crash_fh = open(os.path.join(_crash_dir, "crash.log"), "a")
+        faulthandler.enable(file=_crash_fh, all_threads=True)
+    except Exception:
+        pass
     root = tk.Tk()
     app = tapoStreamer(root)
     root.mainloop()
